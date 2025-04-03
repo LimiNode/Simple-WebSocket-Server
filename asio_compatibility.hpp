@@ -27,12 +27,18 @@ namespace SimpleWeb {
 #endif
 
 namespace SimpleWeb {
-#if(defined(ASIO_STANDALONE) && ASIO_VERSION >= 101300) || BOOST_ASIO_VERSION >= 101300
+#if (defined(ASIO_STANDALONE) && ASIO_VERSION >= 103300) || BOOST_ASIO_VERSION >= 103300
+  using const_buffer = asio::const_buffer;
+#else
+  using const_buffer = asio::const_buffers_1;
+#endif
+
+#if (defined(ASIO_STANDALONE) && ASIO_VERSION >= 101300) || BOOST_ASIO_VERSION >= 101300
   using io_context = asio::io_context;
   using resolver_results = asio::ip::tcp::resolver::results_type;
   using async_connect_endpoint = asio::ip::tcp::endpoint;
 
-#if(defined(ASIO_STANDALONE) && ASIO_VERSION >= 101800) || BOOST_ASIO_VERSION >= 101800
+#if (defined(ASIO_STANDALONE) && ASIO_VERSION >= 101800) || BOOST_ASIO_VERSION >= 101800
   using strand = asio::strand<asio::any_io_executor>;
 #else
   using strand = asio::strand<asio::executor>;
