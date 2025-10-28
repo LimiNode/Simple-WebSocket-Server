@@ -42,8 +42,20 @@ if(USE_STANDALONE_ASIO)
         target_include_directories(simple-websocket-server SYSTEM INTERFACE ${ASIO_PATH})
     endif()
 else()
-    find_package(Boost 1.54.0 COMPONENTS system REQUIRED)
-    target_link_libraries(simple-websocket-server INTERFACE Boost::boost Boost::system)
+    # In Boost 1.89.0+, system is header-only, so we try to find it but make it optional
+    find_package(Boost 1.54.0 COMPONENTS system)
+    if(NOT Boost_FOUND)
+        # Fallback: try without system component for newer Boost versions where it's header-only
+        find_package(Boost 1.54.0 REQUIRED)
+    endif()
+
+    target_link_libraries(simple-websocket-server INTERFACE Boost::boost)
+
+    # Only link Boost::system if the target exists (for older Boost < 1.89)
+    if(TARGET Boost::system)
+        target_link_libraries(simple-websocket-server INTERFACE Boost::system)
+    endif()
+
     if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 4.9)
         target_compile_definitions(simple-websocket-server INTERFACE USE_BOOST_REGEX)
         find_package(Boost 1.54.0 COMPONENTS regex REQUIRED)
