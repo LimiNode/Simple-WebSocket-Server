@@ -49,6 +49,10 @@ namespace SimpleWeb {
       }
     }
 
+    ~SocketServer() noexcept override {
+      this->stop();
+    }
+
   protected:
     asio::ssl::context context;
 

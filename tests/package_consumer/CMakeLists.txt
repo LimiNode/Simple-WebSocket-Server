@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.7)
+project(simple_websocket_server_consumer LANGUAGES CXX)
+find_package(SimpleWebSocketServer CONFIG REQUIRED)
+add_executable(consumer main.cpp)
+target_link_libraries(consumer PRIVATE SimpleWebSocketServer::simple-websocket-server)
+set_target_properties(consumer PROPERTIES CXX_STANDARD 11 CXX_STANDARD_REQUIRED ON)

@@ -2,7 +2,9 @@
 #define SIMPLE_WEB_UTILITY_HPP
 
 #include "status_code.hpp"
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
@@ -42,7 +44,7 @@ namespace SimpleWeb {
   inline bool case_insensitive_equal(const std::string &str1, const std::string &str2) noexcept {
     return str1.size() == str2.size() &&
            std::equal(str1.begin(), str1.end(), str2.begin(), [](char a, char b) {
-             return tolower(a) == tolower(b);
+             return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b));
            });
   }
   class CaseInsensitiveEqual {
@@ -58,12 +60,35 @@ namespace SimpleWeb {
       std::size_t h = 0;
       std::hash<int> hash;
       for(auto c : str)
-        h ^= hash(tolower(c)) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= hash(std::tolower(static_cast<unsigned char>(c))) + 0x9e3779b9 + (h << 6) + (h >> 2);
       return h;
     }
   };
 
   using CaseInsensitiveMultimap = std::unordered_multimap<std::string, std::string, CaseInsensitiveHash, CaseInsensitiveEqual>;
+
+  /// Validate the bits which describe a WebSocket frame before reading its payload.
+  /// `fragmented` is true while a fragmented data message is in progress.
+  inline bool valid_frame_header(unsigned char header, bool fragmented) noexcept {
+    const unsigned char opcode = header & 0x0f;
+    const bool fin = (header & 0x80) != 0;
+    const bool control = opcode >= 8;
+
+    if((header & 0x70) != 0) // RSV1/RSV2/RSV3 are not negotiated by this library.
+      return false;
+    if(opcode != 0 && opcode != 1 && opcode != 2 && opcode != 8 && opcode != 9 && opcode != 10)
+      return false;
+    if(control && !fin)
+      return false;
+    if(fragmented ? (opcode == 1 || opcode == 2) : opcode == 0)
+      return false;
+    return true;
+  }
+
+  inline std::string format_authority(const std::string &host, unsigned short port) {
+    const bool ipv6 = !host.empty() && host.find(':') != std::string::npos && host.front() != '[';
+    return (ipv6 ? "[" + host + "]" : host) + ":" + std::to_string(port);
+  }
 
   /// Percent encoding and decoding
   class Percent {

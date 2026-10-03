@@ -106,6 +106,12 @@ int main() {
   ASSERT(hash("Test") == hash("tesT"));
   ASSERT(hash("tesT") == hash("test"));
   ASSERT(hash("test") != hash("tset"));
+  ASSERT(valid_frame_header(0x81, false));
+  ASSERT(valid_frame_header(0x00, true));
+  ASSERT(!valid_frame_header(0x00, false));
+  ASSERT(!valid_frame_header(0x01, true));
+  ASSERT(!valid_frame_header(0x09, false));
+  ASSERT(format_authority("::1", 8080) == "[::1]:8080");
 
   SocketServerTest serverTest;
   serverTest.io_service = std::make_shared<io_context>();

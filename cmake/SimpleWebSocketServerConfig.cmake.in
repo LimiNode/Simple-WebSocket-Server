@@ -1,0 +1,19 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+find_dependency(OpenSSL)
+
+if(@USE_STANDALONE_ASIO@)
+  if(NOT TARGET asio::asio)
+    find_path(SIMPLE_WEBSOCKET_SERVER_ASIO_INCLUDE_DIR asio.hpp REQUIRED)
+    add_library(asio::asio INTERFACE IMPORTED)
+    set_target_properties(asio::asio PROPERTIES
+      INTERFACE_INCLUDE_DIRECTORIES "${SIMPLE_WEBSOCKET_SERVER_ASIO_INCLUDE_DIR}")
+  endif()
+else()
+  find_dependency(Boost 1.54)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/SimpleWebSocketServerTargets.cmake")
+check_required_components(SimpleWebSocketServer)

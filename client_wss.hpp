@@ -60,6 +60,10 @@ namespace SimpleWeb {
         context.set_verify_mode(asio::ssl::verify_none);
     };
 
+    ~SocketClient() noexcept override {
+      this->stop();
+    }
+
   protected:
     asio::ssl::context context;
 
@@ -98,7 +102,7 @@ namespace SimpleWeb {
               if(!this->config.proxy_server.empty()) {
                 auto streambuf = std::make_shared<asio::streambuf>();
                 std::ostream ostream(streambuf.get());
-                auto host_port = this->host + ':' + std::to_string(this->port);
+                auto host_port = format_authority(this->host, this->port);
                 ostream << "CONNECT " + host_port + " HTTP/1.1\r\n"
                         << "Host: " << host_port << "\r\n";
                 if(!this->config.proxy_auth.empty())
@@ -119,6 +123,10 @@ namespace SimpleWeb {
                       if(!lock)
                         return;
                       if(!ec) {
+                        if(connection->in_message->streambuf.size() > this->config.max_handshake_size) {
+                          this->connection_error(connection, make_error_code::make_error_code(errc::message_size));
+                          return;
+                        }
                         if(!ResponseMessage::parse(*connection->in_message, connection->http_version, connection->status_code, connection->header))
                           this->connection_error(connection, make_error_code::make_error_code(errc::protocol_error));
                         else {

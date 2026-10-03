@@ -7,6 +7,7 @@
 #include "utility.hpp"
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <iostream>
 #include <limits>
 #include <list>
@@ -250,9 +251,8 @@ namespace SimpleWeb {
 
       void send_close(int status, const std::string &reason = "", std::function<void(const error_code &)> callback = nullptr) {
         // Send close only once (in case close is initiated by client)
-        if(close_sent)
+        if(close_sent.exchange(true))
           return;
-        close_sent = true;
 
         auto out_message = std::make_shared<OutMessage>();
 
@@ -288,9 +288,11 @@ namespace SimpleWeb {
       long timeout_request = 0;
       /// Idle timeout. Defaults to no timeout.
       long timeout_idle = 0;
-      /// Maximum size of incoming messages. Defaults to architecture maximum.
+      /// Maximum size of incoming messages. Defaults to 16 MiB.
       /// Exceeding this limit will result in a message_size error code and the connection will be closed.
-      std::size_t max_message_size = (std::numeric_limits<std::size_t>::max)();
+      std::size_t max_message_size = 16 * 1024 * 1024;
+      /// Maximum bytes accepted for the HTTP upgrade response.
+      std::size_t max_handshake_size = 16 * 1024;
       /// Additional header fields to send when performing WebSocket upgrade.
       /// Use this variable to for instance set Sec-WebSocket-Protocol.
       CaseInsensitiveMultimap header;
@@ -317,6 +319,10 @@ namespace SimpleWeb {
       {
         std::lock_guard<std::mutex> lock(start_stop_mutex);
 
+        // Each start owns a new cancellation scope. Late callbacks from an
+        // earlier start retain the old, stopped scope and are ignored.
+        handler_runner = std::shared_ptr<ScopeRunner>(new ScopeRunner());
+
         if(!io_service) {
           io_service = std::make_shared<io_context>();
           internal_io_service = true;
@@ -339,20 +345,26 @@ namespace SimpleWeb {
 
     /// Stop client, and close current connection
     void stop() noexcept {
-      std::lock_guard<std::mutex> lock(start_stop_mutex);
-
+      std::shared_ptr<ScopeRunner> runner;
       {
-        LockGuard lock(connection_mutex);
-        if(connection)
-          connection->close();
+        std::lock_guard<std::mutex> lock(start_stop_mutex);
+        runner = handler_runner;
+
+        {
+          LockGuard lock(connection_mutex);
+          if(connection)
+            connection->close();
+        }
+
+        if(internal_io_service && io_service)
+          io_service->stop();
       }
 
-      if(internal_io_service)
-        io_service->stop();
+      if(runner)
+        runner->stop();
     }
 
     virtual ~SocketClientBase() noexcept {
-      handler_runner->stop();
       stop();
     }
 
@@ -421,12 +433,12 @@ namespace SimpleWeb {
     void upgrade(const std::shared_ptr<Connection> &connection) {
       auto corrected_path = path;
       if(!config.proxy_server.empty() && std::is_same<socket_type, asio::ip::tcp::socket>::value)
-        corrected_path = "http://" + host + ':' + std::to_string(port) + corrected_path;
+        corrected_path = "http://" + format_authority(host, port) + corrected_path;
 
       auto streambuf = std::make_shared<asio::streambuf>();
       std::ostream ostream(streambuf.get());
       ostream << "GET " << corrected_path << " HTTP/1.1\r\n";
-      ostream << "Host: " << host;
+      ostream << "Host: " << (host.find(':') != std::string::npos ? "[" + host + "]" : host);
       if(port != default_port)
         ostream << ':' << std::to_string(port);
       ostream << "\r\n";
@@ -446,6 +458,8 @@ namespace SimpleWeb {
       ostream << "Sec-WebSocket-Version: 13\r\n";
       for(auto &header_field : config.header)
         ostream << header_field.first << ": " << header_field.second << "\r\n";
+      if(!config.proxy_server.empty() && !config.proxy_auth.empty())
+        ostream << "Proxy-Authorization: Basic " << Crypto::Base64::encode(config.proxy_auth) << "\r\n";
       ostream << "\r\n";
 
       try {
@@ -470,6 +484,10 @@ namespace SimpleWeb {
             if(!lock)
               return;
             if(!ec) {
+              if(connection->in_message->streambuf.size() > config.max_handshake_size) {
+                this->connection_error(connection, make_error_code::make_error_code(errc::message_size));
+                return;
+              }
               // connection->in_message->streambuf.size() is not necessarily the same as bytes_transferred, from Boost-docs:
               // "After a successful async_read_until operation, the streambuf may contain additional data beyond the delimiter"
               // The chosen solution is to extract lines from the stream directly when parsing the header. What is left of the
@@ -526,6 +544,16 @@ namespace SimpleWeb {
 
             connection->in_message->fin_rsv_opcode = first_bytes[0];
 
+            const unsigned char opcode = first_bytes[0] & 0x0f;
+            const std::size_t advertised_length = first_bytes[1] & 127;
+            if(!valid_frame_header(first_bytes[0], connection->fragmented_in_message != nullptr) ||
+               (opcode >= 8 && advertised_length > 125)) {
+              const std::string reason("invalid WebSocket frame");
+              connection->send_close(1002, reason);
+              this->connection_close(connection, 1002, reason);
+              return;
+            }
+
             // Close connection if masked message from server (protocol error)
             if(first_bytes[1] >= 128) {
               const std::string reason("message from server masked");
@@ -534,7 +562,7 @@ namespace SimpleWeb {
               return;
             }
 
-            std::size_t length = (first_bytes[1] & 127);
+            std::size_t length = advertised_length;
 
             if(length == 126) {
               // 2 next bytes is the size of content
@@ -572,10 +600,24 @@ namespace SimpleWeb {
                   std::array<unsigned char, 8> length_bytes;
                   connection->in_message->read(reinterpret_cast<char *>(&length_bytes[0]), 8);
 
-                  std::size_t length = 0;
+                  if(length_bytes[0] & 0x80) {
+                    const std::string reason("invalid WebSocket payload length");
+                    connection->send_close(1002, reason);
+                    this->connection_close(connection, 1002, reason);
+                    return;
+                  }
+                  std::uint64_t wire_length = 0;
                   std::size_t num_bytes = 8;
                   for(std::size_t c = 0; c < num_bytes; c++)
-                    length += static_cast<std::size_t>(length_bytes[c]) << (8 * (num_bytes - 1 - c));
+                    wire_length = (wire_length << 8) | length_bytes[c];
+
+                  if(wire_length > (std::numeric_limits<std::size_t>::max)()) {
+                    const std::string reason("invalid WebSocket payload length");
+                    connection->send_close(1002, reason);
+                    this->connection_close(connection, 1002, reason);
+                    return;
+                  }
+                  std::size_t length = static_cast<std::size_t>(wire_length);
 
                   connection->in_message->length = length;
                   this->read_message_content(connection, updated_num_additional_bytes > 8 ? updated_num_additional_bytes - 8 : 0);
@@ -596,7 +638,14 @@ namespace SimpleWeb {
     }
 
     void read_message_content(const std::shared_ptr<Connection> &connection, std::size_t num_additional_bytes) {
-      if(connection->in_message->length + (connection->fragmented_in_message ? connection->fragmented_in_message->length : 0) > config.max_message_size) {
+      const std::size_t fragmented_length = connection->fragmented_in_message ? connection->fragmented_in_message->length : 0;
+      if((connection->in_message->fin_rsv_opcode & 0x0f) == 8 && connection->in_message->length == 1) {
+        const std::string reason("invalid close frame");
+        connection->send_close(1002, reason);
+        connection_close(connection, 1002, reason);
+        return;
+      }
+      if(connection->in_message->length > config.max_message_size || fragmented_length > config.max_message_size - connection->in_message->length) {
         connection_error(connection, make_error_code::make_error_code(errc::message_size));
         const int status = 1009;
         const std::string reason = "message too big";

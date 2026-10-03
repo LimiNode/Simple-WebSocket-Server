@@ -7,6 +7,7 @@
 #include "utility.hpp"
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <iostream>
 #include <limits>
 #include <list>
@@ -249,9 +250,8 @@ namespace SimpleWeb {
 
       void send_close(int status, const std::string &reason = "", std::function<void(const error_code &)> callback = nullptr) {
         // Send close only once (in case close is initiated by server)
-        if(close_sent)
+        if(close_sent.exchange(true))
           return;
-        close_sent = true;
 
         auto send_stream = std::make_shared<OutMessage>();
 
@@ -277,8 +277,7 @@ namespace SimpleWeb {
 
       asio::ip::tcp::endpoint local_endpoint() const noexcept {
         try {
-          if(auto connection = this->connection.lock())
-            return connection->socket->lowest_layer().local_endpoint();
+          return socket->lowest_layer().local_endpoint();
         }
         catch(...) {
         }
@@ -345,9 +344,11 @@ namespace SimpleWeb {
       long timeout_request = 5;
       /// Idle timeout. Defaults to no timeout.
       long timeout_idle = 0;
-      /// Maximum size of incoming messages. Defaults to architecture maximum.
+      /// Maximum size of incoming messages. Defaults to 16 MiB.
       /// Exceeding this limit will result in a message_size error code and the connection will be closed.
-      std::size_t max_message_size = (std::numeric_limits<std::size_t>::max)();
+      std::size_t max_message_size = 16 * 1024 * 1024;
+      /// Maximum bytes accepted for the HTTP upgrade request.
+      std::size_t max_handshake_size = 16 * 1024;
       /// Additional header fields to send when performing WebSocket handshake.
       CaseInsensitiveMultimap header;
       /// IPv4 address in dotted decimal form or IPv6 address in hexadecimal notation.
@@ -383,6 +384,8 @@ namespace SimpleWeb {
     /// where its parameter contains the assigned port.
     void start(const std::function<void(unsigned short /*port*/)> &callback = nullptr) {
       std::unique_lock<std::mutex> lock(start_stop_mutex);
+
+      handler_runner = std::shared_ptr<ScopeRunner>(new ScopeRunner());
 
       asio::ip::tcp::endpoint endpoint;
       if(!config.address.empty())
@@ -458,22 +461,30 @@ namespace SimpleWeb {
 
     /// Stop accepting new connections, and close current connections
     void stop() noexcept {
-      std::lock_guard<std::mutex> lock(start_stop_mutex);
+      {
+        std::lock_guard<std::mutex> lock(start_stop_mutex);
 
-      if(acceptor) {
-        error_code ec;
-        acceptor->close(ec);
+        if(acceptor) {
+          error_code ec;
+          acceptor->close(ec);
 
-        for(auto &pair : endpoint) {
-          LockGuard lock(pair.second.connections_mutex);
-          for(auto &connection : pair.second.connections)
-            connection->close();
-          pair.second.connections.clear();
+          for(auto &pair : endpoint) {
+            LockGuard lock(pair.second.connections_mutex);
+            for(auto &connection : pair.second.connections)
+              connection->close();
+            pair.second.connections.clear();
+          }
+
+          if(internal_io_service)
+            io_service->stop();
         }
-
-        if(internal_io_service)
-          io_service->stop();
       }
+
+      // Prevent queued handlers from dereferencing this server after destruction.
+      // ScopeRunner waits for handlers which already entered a callback and rejects
+      // all callbacks which have not started yet.
+      if(handler_runner)
+        handler_runner->stop();
     }
 
     /// Stop accepting new connections
@@ -484,7 +495,9 @@ namespace SimpleWeb {
       }
     }
 
-    virtual ~SocketServerBase() noexcept {}
+    virtual ~SocketServerBase() noexcept {
+      stop();
+    }
 
     std::unordered_set<std::shared_ptr<Connection>> get_connections() noexcept {
       std::unordered_set<std::shared_ptr<Connection>> all_connections;
@@ -544,6 +557,10 @@ namespace SimpleWeb {
         if(!lock)
           return;
         if(!ec) {
+          if(connection->streambuf.size() > config.max_handshake_size) {
+            connection->close();
+            return;
+          }
           std::istream istream(&connection->streambuf);
           if(RequestMessage::parse(istream, connection->method, connection->path, connection->query_string, connection->http_version, connection->header))
             write_handshake(connection);
@@ -634,6 +651,16 @@ namespace SimpleWeb {
 
             unsigned char fin_rsv_opcode = first_bytes[0];
 
+            const unsigned char opcode = fin_rsv_opcode & 0x0f;
+            const std::size_t advertised_length = first_bytes[1] & 127;
+            if(!valid_frame_header(fin_rsv_opcode, connection->fragmented_in_message != nullptr) ||
+               (opcode >= 8 && advertised_length > 125)) {
+              const std::string reason("invalid WebSocket frame");
+              connection->send_close(1002, reason);
+              connection_close(connection, endpoint, 1002, reason);
+              return;
+            }
+
             // Close connection if unmasked message from client (protocol error)
             if(first_bytes[1] < 128) {
               const std::string reason("message from client not masked");
@@ -642,7 +669,7 @@ namespace SimpleWeb {
               return;
             }
 
-            std::size_t length = (first_bytes[1] & 127);
+            std::size_t length = advertised_length;
 
             if(length == 126) {
               // 2 next bytes is the size of content
@@ -683,10 +710,24 @@ namespace SimpleWeb {
                   std::array<unsigned char, 8> length_bytes;
                   istream.read((char *)&length_bytes[0], 8);
 
-                  std::size_t length = 0;
+                  if(length_bytes[0] & 0x80) {
+                    const std::string reason("invalid WebSocket payload length");
+                    connection->send_close(1002, reason);
+                    connection_close(connection, endpoint, 1002, reason);
+                    return;
+                  }
+                  std::uint64_t wire_length = 0;
                   std::size_t num_bytes = 8;
                   for(std::size_t c = 0; c < num_bytes; c++)
-                    length += static_cast<std::size_t>(length_bytes[c]) << (8 * (num_bytes - 1 - c));
+                    wire_length = (wire_length << 8) | length_bytes[c];
+
+                  if(wire_length > (std::numeric_limits<std::size_t>::max)()) {
+                    const std::string reason("invalid WebSocket payload length");
+                    connection->send_close(1002, reason);
+                    connection_close(connection, endpoint, 1002, reason);
+                    return;
+                  }
+                  std::size_t length = static_cast<std::size_t>(wire_length);
 
                   read_message_content(connection, length, endpoint, fin_rsv_opcode);
                 }
@@ -704,7 +745,14 @@ namespace SimpleWeb {
     }
 
     void read_message_content(const std::shared_ptr<Connection> &connection, std::size_t length, Endpoint &endpoint, unsigned char fin_rsv_opcode) const {
-      if(length + (connection->fragmented_in_message ? connection->fragmented_in_message->length : 0) > config.max_message_size) {
+      const std::size_t fragmented_length = connection->fragmented_in_message ? connection->fragmented_in_message->length : 0;
+      if((fin_rsv_opcode & 0x0f) == 8 && length == 1) {
+        const std::string reason("invalid close frame");
+        connection->send_close(1002, reason);
+        connection_close(connection, endpoint, 1002, reason);
+        return;
+      }
+      if(length > config.max_message_size || fragmented_length > config.max_message_size - length) {
         connection_error(connection, endpoint, make_error_code::make_error_code(errc::message_size));
         const int status = 1009;
         const std::string reason = "message too big";
@@ -837,6 +885,9 @@ namespace SimpleWeb {
   class SocketServer<WS> : public SocketServerBase<WS> {
   public:
     SocketServer() noexcept : SocketServerBase<WS>(80) {}
+    ~SocketServer() noexcept override {
+      this->stop();
+    }
 
   protected:
     void accept() override {
