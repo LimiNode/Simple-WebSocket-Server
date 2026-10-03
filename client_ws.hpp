@@ -159,7 +159,7 @@ namespace SimpleWeb {
           auto lock = self->handler_runner->continue_lock();
           if(!lock)
             return;
-          asio::async_write(*self->socket, buffer, [self](const error_code &ec, std::size_t /*bytes_transferred*/) {
+          asio::async_write(*self->socket, buffer, bind_executor(self->read_write_strand, [self](const error_code &ec, std::size_t /*bytes_transferred*/) {
             self->set_timeout(); // Set timeout for next send
             auto lock = self->handler_runner->continue_lock();
             if(!lock)
@@ -191,7 +191,7 @@ namespace SimpleWeb {
                   callback(ec);
               }
             }
-          });
+          }));
         });
       }
 

@@ -457,20 +457,26 @@ namespace SimpleWeb {
 namespace SimpleWeb {
   /// Makes it possible to for instance cancel Asio handlers without stopping asio::io_service.
   class ScopeRunner {
-    /// Scope count that is set to -1 if scopes are to be canceled.
     std::atomic<long> count;
+    std::atomic<bool> cancelled;
 
-  public:
-    static std::size_t &local_scope_count() noexcept {
-      static thread_local std::size_t count = 0;
-      return count;
+    static std::unordered_map<const ScopeRunner *, std::size_t> &local_scope_counts() noexcept {
+      static thread_local std::unordered_map<const ScopeRunner *, std::size_t> counts;
+      return counts;
     }
 
+    std::size_t local_scope_count() const noexcept {
+      auto it = local_scope_counts().find(this);
+      return it == local_scope_counts().end() ? 0 : it->second;
+    }
+
+  public:
     class SharedLock {
       friend class ScopeRunner;
       std::atomic<long> &count;
-      SharedLock(std::atomic<long> &count) noexcept : count(count) {
-        ++ScopeRunner::local_scope_count();
+      const ScopeRunner *owner;
+      SharedLock(std::atomic<long> &count, const ScopeRunner *owner) noexcept : count(count), owner(owner) {
+        ++ScopeRunner::local_scope_counts()[owner];
       }
       SharedLock &operator=(const SharedLock &) = delete;
       SharedLock(const SharedLock &) = delete;
@@ -478,41 +484,53 @@ namespace SimpleWeb {
     public:
       ~SharedLock() noexcept {
         count.fetch_sub(1);
-        --ScopeRunner::local_scope_count();
+        auto &counts = ScopeRunner::local_scope_counts();
+        auto it = counts.find(owner);
+        if(it != counts.end()) {
+          if(--it->second == 0)
+            counts.erase(it);
+        }
       }
     };
 
-    ScopeRunner() noexcept : count(0) {}
+    ScopeRunner() noexcept : count(0), cancelled(false) {}
 
     /// Returns nullptr if scope should be exited, or a shared lock otherwise.
     /// The shared lock ensures that a potential destructor call is delayed until all locks are released.
     std::unique_ptr<SharedLock> continue_lock() noexcept {
-      long expected = count;
-      while(expected >= 0 && !count.compare_exchange_weak(expected, expected + 1))
-        spin_loop_pause();
-
-      if(expected < 0)
+      if(cancelled.load())
         return nullptr;
+
+      long expected = count.load();
+      bool acquired = false;
+      while(expected >= 0 && !cancelled.load()) {
+        if(count.compare_exchange_weak(expected, expected + 1)) {
+          acquired = true;
+          break;
+        }
+        spin_loop_pause();
+      }
+
+      if(!acquired || cancelled.load()) {
+        if(acquired)
+          count.fetch_sub(1);
+        return nullptr;
+      }
       else
-        return std::unique_ptr<SharedLock>(new SharedLock(count));
+        return std::unique_ptr<SharedLock>(new SharedLock(count, this));
     }
 
     /// Blocks until all shared locks are released, then prevents future shared locks.
     /// When called by a handler which currently owns a SharedLock, cancellation is
     /// recorded and the caller returns immediately to avoid self-deadlock. The
-    /// enclosing callback must then return before its owning object is destroyed.
+    /// enclosing callback must return before its owning object is destroyed.
     void stop() noexcept {
-      if(local_scope_count() != 0) {
-        count.store(-1);
+      cancelled.store(true);
+      if(local_scope_count() != 0)
         return;
-      }
-      long expected = 0;
-      while(!count.compare_exchange_weak(expected, -1)) {
-        if(expected < 0)
-          return;
-        expected = 0;
+
+      while(count.load() != 0)
         spin_loop_pause();
-      }
     }
   };
 } // namespace SimpleWeb

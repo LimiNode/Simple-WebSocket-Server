@@ -123,6 +123,26 @@ int main() {
   ASSERT(scope_runner.continue_lock() == nullptr);
   scope_lock.reset();
 
+  ScopeRunner active_scope_a;
+  ScopeRunner active_scope_b;
+  auto active_lock_a = active_scope_a.continue_lock();
+  auto active_lock_b = active_scope_b.continue_lock();
+  active_scope_b.stop();
+  ASSERT(active_lock_a != nullptr);
+  active_lock_b.reset();
+  active_lock_a.reset();
+
+  asio::streambuf bounded_handshake(16);
+  bool bounded_rejected = false;
+  try {
+    bounded_handshake.prepare(17);
+  }
+  catch(const std::exception &) {
+    bounded_rejected = true;
+  }
+  ASSERT(bounded_rejected);
+  ASSERT(bounded_handshake.size() <= 16);
+
   SocketServerTest serverTest;
   serverTest.io_service = std::make_shared<io_context>();
 
