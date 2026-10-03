@@ -10,6 +10,13 @@ This repository is a maintained downstream continuation of eidheim/Simple-WebSoc
 Tags with the `-ln.N` suffix are LimiNode-maintained downstream releases.
 They are not releases published by the original upstream project.
 
+### Downstream compatibility notes
+
+Incoming WebSocket messages are limited to 16 MiB by default, and HTTP upgrade
+buffers are limited to 16 KiB. Applications requiring larger messages or
+handshake headers must set `Config::max_message_size` or
+`Config::max_handshake_size` explicitly.
+
 See https://gitlab.com/eidheim/Simple-Web-Server for an easy way to make REST resources available from C++ applications. Also, feel free to check out the new C++ IDE supporting C++11/14/17: https://gitlab.com/cppit/jucipp. 
 
 ### Features

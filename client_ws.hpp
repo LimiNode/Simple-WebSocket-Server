@@ -71,8 +71,9 @@ namespace SimpleWeb {
 
     private:
       template <typename... Args>
-      Connection(std::shared_ptr<ScopeRunner> handler_runner_, long timeout_idle, Args &&...args) noexcept
-          : handler_runner(std::move(handler_runner_)), socket(new socket_type(std::forward<Args>(args)...)), read_write_strand(get_executor(socket->lowest_layer())), timeout_idle(timeout_idle), close_sent(false) {}
+      Connection(std::shared_ptr<ScopeRunner> handler_runner_, long timeout_idle, std::size_t max_handshake_size, Args &&...args) noexcept
+          : handler_runner(std::move(handler_runner_)), socket(new socket_type(std::forward<Args>(args)...)), read_write_strand(get_executor(socket->lowest_layer())),
+            handshake_streambuf(max_handshake_size), timeout_idle(timeout_idle), close_sent(false) {}
 
       std::shared_ptr<ScopeRunner> handler_runner;
 
@@ -86,6 +87,7 @@ namespace SimpleWeb {
 
       std::shared_ptr<InMessage> in_message;
       std::shared_ptr<InMessage> fragmented_in_message;
+      asio::streambuf handshake_streambuf;
 
       long timeout_idle;
       Mutex timer_mutex;
@@ -478,25 +480,27 @@ namespace SimpleWeb {
           return;
         if(!ec) {
           connection->set_timeout(this->config.timeout_request);
-          asio::async_read_until(*connection->socket, connection->in_message->streambuf, "\r\n\r\n", [this, connection, nonce_base64](const error_code &ec, std::size_t bytes_transferred) {
+          asio::async_read_until(*connection->socket, connection->handshake_streambuf, "\r\n\r\n", [this, connection, nonce_base64](const error_code &ec, std::size_t bytes_transferred) {
             connection->cancel_timeout();
             auto lock = connection->handler_runner->continue_lock();
             if(!lock)
               return;
             if(!ec) {
-              if(connection->in_message->streambuf.size() > config.max_handshake_size) {
-                this->connection_error(connection, make_error_code::make_error_code(errc::message_size));
-                return;
-              }
               // connection->in_message->streambuf.size() is not necessarily the same as bytes_transferred, from Boost-docs:
               // "After a successful async_read_until operation, the streambuf may contain additional data beyond the delimiter"
               // The chosen solution is to extract lines from the stream directly when parsing the header. What is left of the
               // streambuf (maybe some bytes of a message) is appended to in the next async_read-function
-              std::size_t num_additional_bytes = connection->in_message->streambuf.size() - bytes_transferred;
+              std::size_t num_additional_bytes = connection->handshake_streambuf.size() - bytes_transferred;
 
-              if(!ResponseMessage::parse(*connection->in_message, connection->http_version, connection->status_code, connection->header)) {
+              std::istream handshake_stream(&connection->handshake_streambuf);
+              if(!ResponseMessage::parse(handshake_stream, connection->http_version, connection->status_code, connection->header)) {
                 this->connection_error(connection, make_error_code::make_error_code(errc::protocol_error));
                 return;
+              }
+              if(connection->handshake_streambuf.size() > 0) {
+                const auto bytes = connection->handshake_streambuf.size();
+                connection->in_message->streambuf.commit(asio::buffer_copy(connection->in_message->streambuf.prepare(bytes), connection->handshake_streambuf.data()));
+                connection->handshake_streambuf.consume(bytes);
               }
               if(connection->status_code.compare(0, 4, "101 ") != 0) {
                 this->connection_error(connection, make_error_code::make_error_code(errc::permission_denied));
@@ -645,7 +649,8 @@ namespace SimpleWeb {
         connection_close(connection, 1002, reason);
         return;
       }
-      if(connection->in_message->length > config.max_message_size || fragmented_length > config.max_message_size - connection->in_message->length) {
+      const bool control_frame = (connection->in_message->fin_rsv_opcode & 0x0f) >= 8;
+      if(!control_frame && (connection->in_message->length > config.max_message_size || fragmented_length > config.max_message_size - connection->in_message->length)) {
         connection_error(connection, make_error_code::make_error_code(errc::message_size));
         const int status = 1009;
         const std::string reason = "message too big";
@@ -654,7 +659,7 @@ namespace SimpleWeb {
         return;
       }
       connection->set_timeout();
-      asio::async_read(*connection->socket, connection->in_message->streambuf, asio::transfer_exactly(num_additional_bytes > connection->in_message->length ? 0 : connection->in_message->length - num_additional_bytes), [this, connection, num_additional_bytes](const error_code &ec, std::size_t /*bytes_transferred*/) {
+      asio::async_read(*connection->socket, connection->in_message->streambuf, asio::transfer_exactly(num_additional_bytes > connection->in_message->length ? 0 : connection->in_message->length - num_additional_bytes), bind_executor(connection->read_write_strand, [this, connection, num_additional_bytes](const error_code &ec, std::size_t /*bytes_transferred*/) {
         connection->cancel_timeout();
         auto lock = connection->handler_runner->continue_lock();
         if(!lock)
@@ -755,7 +760,7 @@ namespace SimpleWeb {
         }
         else
           this->connection_error(connection, ec);
-      });
+      }));
     }
 
     void connection_open(const std::shared_ptr<Connection> &connection) const {
@@ -787,7 +792,7 @@ namespace SimpleWeb {
   protected:
     void connect() override {
       LockGuard lock(connection_mutex);
-      auto connection = this->connection = std::shared_ptr<Connection>(new Connection(handler_runner, config.timeout_idle, *io_service));
+      auto connection = this->connection = std::shared_ptr<Connection>(new Connection(handler_runner, config.timeout_idle, config.max_handshake_size, *io_service));
       lock.unlock();
 
       std::pair<std::string, std::string> host_port;

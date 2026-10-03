@@ -8,6 +8,9 @@ jobs:
   linux:
     name: ${{ matrix.compiler }} / C++${{ matrix.standard }} / ${{ matrix.asio }}
     runs-on: ubuntu-24.04
+    env:
+      CC: ${{ matrix.compiler == 'gcc' && 'gcc' || 'clang' }}
+      CXX: ${{ matrix.compiler == 'gcc' && 'g++' || 'clang++' }}
     strategy:
       fail-fast: false
       matrix:
@@ -21,9 +24,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build libssl-dev libasio-dev libboost-all-dev
       - name: Configure
-        env:
-          CC: ${{ matrix.compiler == 'gcc' && 'gcc' || 'clang' }}
-          CXX: ${{ matrix.compiler == 'gcc' && 'g++' || 'clang++' }}
         run: >-
           cmake -S . -B build -G Ninja
           -DCMAKE_CXX_STANDARD=${{ matrix.standard }}

@@ -461,16 +461,24 @@ namespace SimpleWeb {
     std::atomic<long> count;
 
   public:
+    static std::size_t &local_scope_count() noexcept {
+      static thread_local std::size_t count = 0;
+      return count;
+    }
+
     class SharedLock {
       friend class ScopeRunner;
       std::atomic<long> &count;
-      SharedLock(std::atomic<long> &count) noexcept : count(count) {}
+      SharedLock(std::atomic<long> &count) noexcept : count(count) {
+        ++ScopeRunner::local_scope_count();
+      }
       SharedLock &operator=(const SharedLock &) = delete;
       SharedLock(const SharedLock &) = delete;
 
     public:
       ~SharedLock() noexcept {
         count.fetch_sub(1);
+        --ScopeRunner::local_scope_count();
       }
     };
 
@@ -490,7 +498,14 @@ namespace SimpleWeb {
     }
 
     /// Blocks until all shared locks are released, then prevents future shared locks.
+    /// When called by a handler which currently owns a SharedLock, cancellation is
+    /// recorded and the caller returns immediately to avoid self-deadlock. The
+    /// enclosing callback must then return before its owning object is destroyed.
     void stop() noexcept {
+      if(local_scope_count() != 0) {
+        count.store(-1);
+        return;
+      }
       long expected = 0;
       while(!count.compare_exchange_weak(expected, -1)) {
         if(expected < 0)

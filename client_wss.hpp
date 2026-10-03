@@ -69,7 +69,7 @@ namespace SimpleWeb {
 
     void connect() override {
       LockGuard connection_lock(connection_mutex);
-      auto connection = this->connection = std::shared_ptr<Connection>(new Connection(handler_runner, config.timeout_idle, *io_service, context));
+      auto connection = this->connection = std::shared_ptr<Connection>(new Connection(handler_runner, config.timeout_idle, config.max_handshake_size, *io_service, context));
       connection_lock.unlock();
 
       std::pair<std::string, std::string> host_port;
@@ -117,19 +117,21 @@ namespace SimpleWeb {
                   if(!ec) {
                     connection->set_timeout(this->config.timeout_request);
                     connection->in_message = std::shared_ptr<InMessage>(new InMessage());
-                    asio::async_read_until(connection->socket->next_layer(), connection->in_message->streambuf, "\r\n\r\n", [this, connection](const error_code &ec, std::size_t /*bytes_transferred*/) {
+                    asio::async_read_until(connection->socket->next_layer(), connection->handshake_streambuf, "\r\n\r\n", [this, connection](const error_code &ec, std::size_t /*bytes_transferred*/) {
                       connection->cancel_timeout();
                       auto lock = connection->handler_runner->continue_lock();
                       if(!lock)
                         return;
                       if(!ec) {
-                        if(connection->in_message->streambuf.size() > this->config.max_handshake_size) {
-                          this->connection_error(connection, make_error_code::make_error_code(errc::message_size));
-                          return;
-                        }
-                        if(!ResponseMessage::parse(*connection->in_message, connection->http_version, connection->status_code, connection->header))
+                        std::istream handshake_stream(&connection->handshake_streambuf);
+                        if(!ResponseMessage::parse(handshake_stream, connection->http_version, connection->status_code, connection->header))
                           this->connection_error(connection, make_error_code::make_error_code(errc::protocol_error));
                         else {
+                          if(connection->handshake_streambuf.size() > 0) {
+                            const auto bytes = connection->handshake_streambuf.size();
+                            connection->in_message->streambuf.commit(asio::buffer_copy(connection->in_message->streambuf.prepare(bytes), connection->handshake_streambuf.data()));
+                            connection->handshake_streambuf.consume(bytes);
+                          }
                           if(connection->status_code.compare(0, 3, "200") != 0)
                             this->connection_error(connection, make_error_code::make_error_code(errc::permission_denied));
                           else

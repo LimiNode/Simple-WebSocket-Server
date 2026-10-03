@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.7)
+cmake_minimum_required(VERSION 3.8)
 project(simple_websocket_server_consumer LANGUAGES CXX)
 find_package(SimpleWebSocketServer CONFIG REQUIRED)
 add_executable(consumer main.cpp)
