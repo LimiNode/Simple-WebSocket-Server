@@ -9,6 +9,7 @@ This repository is a maintained downstream continuation of eidheim/Simple-WebSoc
 
 Tags with the `-ln.N` suffix are LimiNode-maintained downstream releases.
 They are not releases published by the original upstream project.
+The `v2.0.3-ln.1` release is represented as CMake package version `2.0.3.1`.
 
 ### Downstream compatibility notes
 
@@ -17,10 +18,13 @@ buffers are limited to 16 KiB. Applications requiring larger messages or
 handshake headers must set `Config::max_message_size` or
 `Config::max_handshake_size` explicitly.
 
-Applications must keep the owning server or client alive until a user
-callback returns. Calling `stop()` from a callback is supported and cancels
-future handlers; destroying the owner synchronously from inside its own
-callback is not a supported ownership pattern in C++.
+Applications must keep the owning server or client alive until all callbacks
+that have already entered the library have returned. Calling `stop()` from a
+callback is supported as a cancellation request for future handlers, but it
+is not a quiescence barrier for callbacks already running on other threads.
+Before destroying the owner, an external caller must complete the normal
+`stop()`/destructor barrier. Destroying the owner synchronously from inside
+its own callback is not a supported ownership pattern in C++.
 
 See https://gitlab.com/eidheim/Simple-Web-Server for an easy way to make REST resources available from C++ applications. Also, feel free to check out the new C++ IDE supporting C++11/14/17: https://gitlab.com/cppit/jucipp. 
 

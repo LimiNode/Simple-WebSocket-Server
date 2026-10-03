@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.8)
 
-project(Simple-WebSocket-Server VERSION 2.0.3 LANGUAGES CXX)
+# CMake uses a numeric fourth component for the downstream -ln.1 release.
+project(Simple-WebSocket-Server VERSION 2.0.3.1 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 

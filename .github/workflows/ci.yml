@@ -84,7 +84,7 @@ jobs:
       - name: Configure
         run: >-
           cmake -S . -B build -A x64
-          -DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake
+          -DCMAKE_TOOLCHAIN_FILE="$($env:VCPKG_INSTALLATION_ROOT)/scripts/buildsystems/vcpkg.cmake"
           -DCMAKE_CXX_STANDARD=${{ matrix.standard }}
           -DUSE_STANDALONE_ASIO=${{ matrix.asio == 'standalone' && 'ON' || 'OFF' }}
           -DBUILD_TESTING=ON
