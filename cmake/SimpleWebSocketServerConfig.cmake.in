@@ -6,7 +6,13 @@ find_dependency(OpenSSL)
 
 if(@USE_STANDALONE_ASIO@)
   if(NOT TARGET asio::asio)
-    find_path(SIMPLE_WEBSOCKET_SERVER_ASIO_INCLUDE_DIR asio.hpp REQUIRED)
+    find_path(SIMPLE_WEBSOCKET_SERVER_ASIO_INCLUDE_DIR asio.hpp)
+    if(NOT SIMPLE_WEBSOCKET_SERVER_ASIO_INCLUDE_DIR)
+      set(SimpleWebSocketServer_FOUND FALSE)
+      set(SimpleWebSocketServer_NOT_FOUND_MESSAGE
+          "Standalone Asio headers were not found")
+      return()
+    endif()
     add_library(asio::asio INTERFACE IMPORTED)
     set_target_properties(asio::asio PROPERTIES
       INTERFACE_INCLUDE_DIRECTORIES "${SIMPLE_WEBSOCKET_SERVER_ASIO_INCLUDE_DIR}")
