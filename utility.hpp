@@ -2,7 +2,9 @@
 #define SIMPLE_WEB_UTILITY_HPP
 
 #include "status_code.hpp"
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
@@ -42,7 +44,7 @@ namespace SimpleWeb {
   inline bool case_insensitive_equal(const std::string &str1, const std::string &str2) noexcept {
     return str1.size() == str2.size() &&
            std::equal(str1.begin(), str1.end(), str2.begin(), [](char a, char b) {
-             return tolower(a) == tolower(b);
+             return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b));
            });
   }
   class CaseInsensitiveEqual {
@@ -58,12 +60,35 @@ namespace SimpleWeb {
       std::size_t h = 0;
       std::hash<int> hash;
       for(auto c : str)
-        h ^= hash(tolower(c)) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= hash(std::tolower(static_cast<unsigned char>(c))) + 0x9e3779b9 + (h << 6) + (h >> 2);
       return h;
     }
   };
 
   using CaseInsensitiveMultimap = std::unordered_multimap<std::string, std::string, CaseInsensitiveHash, CaseInsensitiveEqual>;
+
+  /// Validate the bits which describe a WebSocket frame before reading its payload.
+  /// `fragmented` is true while a fragmented data message is in progress.
+  inline bool valid_frame_header(unsigned char header, bool fragmented) noexcept {
+    const unsigned char opcode = header & 0x0f;
+    const bool fin = (header & 0x80) != 0;
+    const bool control = opcode >= 8;
+
+    if((header & 0x70) != 0) // RSV1/RSV2/RSV3 are not negotiated by this library.
+      return false;
+    if(opcode != 0 && opcode != 1 && opcode != 2 && opcode != 8 && opcode != 9 && opcode != 10)
+      return false;
+    if(control && !fin)
+      return false;
+    if(fragmented ? (opcode == 1 || opcode == 2) : opcode == 0)
+      return false;
+    return true;
+  }
+
+  inline std::string format_authority(const std::string &host, unsigned short port) {
+    const bool ipv6 = !host.empty() && host.find(':') != std::string::npos && host.front() != '[';
+    return (ipv6 ? "[" + host + "]" : host) + ":" + std::to_string(port);
+  }
 
   /// Percent encoding and decoding
   class Percent {
@@ -432,47 +457,80 @@ namespace SimpleWeb {
 namespace SimpleWeb {
   /// Makes it possible to for instance cancel Asio handlers without stopping asio::io_service.
   class ScopeRunner {
-    /// Scope count that is set to -1 if scopes are to be canceled.
     std::atomic<long> count;
+    std::atomic<bool> cancelled;
+
+    static std::unordered_map<const ScopeRunner *, std::size_t> &local_scope_counts() noexcept {
+      static thread_local std::unordered_map<const ScopeRunner *, std::size_t> counts;
+      return counts;
+    }
+
+    std::size_t local_scope_count() const noexcept {
+      auto it = local_scope_counts().find(this);
+      return it == local_scope_counts().end() ? 0 : it->second;
+    }
 
   public:
     class SharedLock {
       friend class ScopeRunner;
       std::atomic<long> &count;
-      SharedLock(std::atomic<long> &count) noexcept : count(count) {}
+      const ScopeRunner *owner;
+      SharedLock(std::atomic<long> &count, const ScopeRunner *owner) noexcept : count(count), owner(owner) {
+        ++ScopeRunner::local_scope_counts()[owner];
+      }
       SharedLock &operator=(const SharedLock &) = delete;
       SharedLock(const SharedLock &) = delete;
 
     public:
       ~SharedLock() noexcept {
         count.fetch_sub(1);
+        auto &counts = ScopeRunner::local_scope_counts();
+        auto it = counts.find(owner);
+        if(it != counts.end()) {
+          if(--it->second == 0)
+            counts.erase(it);
+        }
       }
     };
 
-    ScopeRunner() noexcept : count(0) {}
+    ScopeRunner() noexcept : count(0), cancelled(false) {}
 
     /// Returns nullptr if scope should be exited, or a shared lock otherwise.
     /// The shared lock ensures that a potential destructor call is delayed until all locks are released.
     std::unique_ptr<SharedLock> continue_lock() noexcept {
-      long expected = count;
-      while(expected >= 0 && !count.compare_exchange_weak(expected, expected + 1))
-        spin_loop_pause();
-
-      if(expected < 0)
+      if(cancelled.load())
         return nullptr;
+
+      long expected = count.load();
+      bool acquired = false;
+      while(expected >= 0 && !cancelled.load()) {
+        if(count.compare_exchange_weak(expected, expected + 1)) {
+          acquired = true;
+          break;
+        }
+        spin_loop_pause();
+      }
+
+      if(!acquired || cancelled.load()) {
+        if(acquired)
+          count.fetch_sub(1);
+        return nullptr;
+      }
       else
-        return std::unique_ptr<SharedLock>(new SharedLock(count));
+        return std::unique_ptr<SharedLock>(new SharedLock(count, this));
     }
 
     /// Blocks until all shared locks are released, then prevents future shared locks.
+    /// When called by a handler which currently owns a SharedLock, cancellation is
+    /// recorded and the caller returns immediately to avoid self-deadlock. The
+    /// enclosing callback must return before its owning object is destroyed.
     void stop() noexcept {
-      long expected = 0;
-      while(!count.compare_exchange_weak(expected, -1)) {
-        if(expected < 0)
-          return;
-        expected = 0;
+      cancelled.store(true);
+      if(local_scope_count() != 0)
+        return;
+
+      while(count.load() != 0)
         spin_loop_pause();
-      }
     }
   };
 } // namespace SimpleWeb

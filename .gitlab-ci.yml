@@ -1,32 +1,33 @@
-before_script:
-  - mkdir build && cd build
-  - export CXXFLAGS=-Werror
-  - export CTEST_OUTPUT_ON_FAILURE=1
+stages:
+  - build
+  - sanitize
 
-.script: &compile_and_test
+build:
+  image: ubuntu:24.04
+  parallel:
+    matrix:
+      - COMPILER: [gcc, clang]
+        CXX_STANDARD: [11, 17]
+        ASIO_BACKEND: [standalone, boost]
+  stage: build
+  before_script:
+    - apt-get update
+    - DEBIAN_FRONTEND=noninteractive apt-get install -y cmake ninja-build libssl-dev libasio-dev libboost-all-dev $COMPILER
   script:
-  - cmake -DCMAKE_BUILD_TYPE=Release .. && make && make test
-  - rm -r *
-  - cmake -DCMAKE_BUILD_TYPE=Release -DUSE_STANDALONE_ASIO=ON .. && make && make test
+    - export CC=$COMPILER
+    - if [ "$COMPILER" = gcc ]; then export CXX=g++; else export CXX=clang++; fi
+    - cmake -S . -B build -G Ninja -DCMAKE_CXX_STANDARD=$CXX_STANDARD -DUSE_STANDALONE_ASIO=$([ "$ASIO_BACKEND" = standalone ] && echo ON || echo OFF) -DBUILD_TESTING=ON
+    - cmake --build build --parallel
+    - ctest --test-dir build --output-on-failure
 
-arch:
-  image: "registry.gitlab.com/eidheim/docker-images:arch"
-  <<: *compile_and_test
-
-buster:
-  image: "registry.gitlab.com/eidheim/docker-images:buster"
-  <<: *compile_and_test
-
-stretch:
-  image: "registry.gitlab.com/eidheim/docker-images:stretch"
-  <<: *compile_and_test
-
-thread-safety-analysis:
-  image: "registry.gitlab.com/eidheim/docker-images:arch"
+sanitizers:
+  image: ubuntu:24.04
+  stage: sanitize
+  before_script:
+    - apt-get update
+    - DEBIAN_FRONTEND=noninteractive apt-get install -y cmake ninja-build clang libssl-dev libasio-dev
   script:
-  - CXX=clang++ cmake .. && make
-
-static-analysis:
-  image: "registry.gitlab.com/eidheim/docker-images:arch"
-  script:
-    - scan-build cmake .. && scan-build --status-bugs make
+    - export CC=clang CXX=clang++
+    - cmake -S . -B build -G Ninja -DCMAKE_CXX_STANDARD=17 -DUSE_STANDALONE_ASIO=ON -DBUILD_TESTING=ON -DCMAKE_CXX_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' -DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address,undefined'
+    - cmake --build build --parallel
+    - ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 ctest --test-dir build --output-on-failure

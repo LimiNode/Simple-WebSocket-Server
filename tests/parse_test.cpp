@@ -13,7 +13,8 @@ public:
   void accept() {}
 
   void parse_request_test() {
-    std::shared_ptr<Connection> connection(new Connection(handler_runner, 0, *io_service));
+    std::shared_ptr<Connection> connection(new Connection(handler_runner, 0, config.max_handshake_size, *io_service));
+    ASSERT(connection->handshake_streambuf.max_size() == config.max_handshake_size);
 
     ostream ss(&connection->streambuf);
     ss << "GET /test/ HTTP/1.1\r\n";
@@ -58,7 +59,8 @@ public:
   void connect() {}
 
   void parse_response_header_test() {
-    auto connection = std::shared_ptr<Connection>(new Connection(handler_runner, config.timeout_idle, *io_service));
+    auto connection = std::shared_ptr<Connection>(new Connection(handler_runner, config.timeout_idle, config.max_handshake_size, *io_service));
+    ASSERT(connection->handshake_streambuf.max_size() == config.max_handshake_size);
     connection->in_message = std::shared_ptr<InMessage>(new InMessage());
 
     ostream stream(&connection->in_message->streambuf);
@@ -106,6 +108,40 @@ int main() {
   ASSERT(hash("Test") == hash("tesT"));
   ASSERT(hash("tesT") == hash("test"));
   ASSERT(hash("test") != hash("tset"));
+  ASSERT(valid_frame_header(0x81, false));
+  ASSERT(valid_frame_header(0x00, true));
+  ASSERT(!valid_frame_header(0x00, false));
+  ASSERT(!valid_frame_header(0x01, true));
+  ASSERT(!valid_frame_header(0x09, false));
+  ASSERT(format_authority("::1", 8080) == "[::1]:8080");
+
+  // stop() from an active callback must cancel without self-deadlocking.
+  ScopeRunner scope_runner;
+  auto scope_lock = scope_runner.continue_lock();
+  ASSERT(scope_lock != nullptr);
+  scope_runner.stop();
+  ASSERT(scope_runner.continue_lock() == nullptr);
+  scope_lock.reset();
+
+  ScopeRunner active_scope_a;
+  ScopeRunner active_scope_b;
+  auto active_lock_a = active_scope_a.continue_lock();
+  auto active_lock_b = active_scope_b.continue_lock();
+  active_scope_b.stop();
+  ASSERT(active_lock_a != nullptr);
+  active_lock_b.reset();
+  active_lock_a.reset();
+
+  asio::streambuf bounded_handshake(16);
+  bool bounded_rejected = false;
+  try {
+    bounded_handshake.prepare(17);
+  }
+  catch(const std::exception &) {
+    bounded_rejected = true;
+  }
+  ASSERT(bounded_rejected);
+  ASSERT(bounded_handshake.size() <= 16);
 
   SocketServerTest serverTest;
   serverTest.io_service = std::make_shared<io_context>();

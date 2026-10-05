@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    name: ${{ matrix.compiler }} / C++${{ matrix.standard }} / ${{ matrix.asio }}
+    runs-on: ubuntu-24.04
+    env:
+      CC: ${{ matrix.compiler == 'gcc' && 'gcc' || 'clang' }}
+      CXX: ${{ matrix.compiler == 'gcc' && 'g++' || 'clang++' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        standard: [11, 17]
+        asio: [standalone, boost]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libssl-dev libasio-dev libboost-all-dev
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja
+          -DCMAKE_CXX_STANDARD=${{ matrix.standard }}
+          -DUSE_STANDALONE_ASIO=${{ matrix.asio == 'standalone' && 'ON' || 'OFF' }}
+          -DBUILD_TESTING=ON
+      - name: Build and test
+        run: |
+          cmake --build build --parallel
+          ctest --test-dir build --output-on-failure
+      - name: Install and consume package
+        run: |
+          cmake --install build --prefix "$RUNNER_TEMP/simple-websocket-server"
+          cmake -S tests/package_consumer -B "$RUNNER_TEMP/consumer" -G Ninja -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/simple-websocket-server"
+          cmake --build "$RUNNER_TEMP/consumer" --parallel
+
+  sanitizers:
+    name: Clang sanitizers
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build clang libssl-dev libasio-dev
+      - name: Configure
+        env:
+          CC: clang
+          CXX: clang++
+        run: >-
+          cmake -S . -B build -G Ninja
+          -DCMAKE_CXX_STANDARD=17
+          -DUSE_STANDALONE_ASIO=ON
+          -DBUILD_TESTING=ON
+          -DCMAKE_CXX_FLAGS=-fsanitize=address,undefined\ -fno-omit-frame-pointer
+          -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined
+      - name: Build and test
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1
+        run: |
+          cmake --build build --parallel
+          ctest --test-dir build --output-on-failure
+
+  windows:
+    name: MSVC / C++${{ matrix.standard }} / ${{ matrix.asio }}
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        standard: [11, 17]
+        asio: [standalone, boost]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          vcpkg install asio:x64-windows openssl:x64-windows
+          vcpkg install boost:x64-windows
+      - name: Configure
+        run: >-
+          cmake -S . -B build -A x64
+          -DCMAKE_TOOLCHAIN_FILE="$($env:VCPKG_INSTALLATION_ROOT)/scripts/buildsystems/vcpkg.cmake"
+          -DCMAKE_CXX_STANDARD=${{ matrix.standard }}
+          -DUSE_STANDALONE_ASIO=${{ matrix.asio == 'standalone' && 'ON' || 'OFF' }}
+          -DBUILD_TESTING=ON
+      - name: Build and test
+        run: |
+          cmake --build build --config Release --parallel
+          ctest --test-dir build -C Release --output-on-failure

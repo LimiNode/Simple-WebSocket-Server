@@ -49,6 +49,10 @@ namespace SimpleWeb {
       }
     }
 
+    ~SocketServer() noexcept override {
+      this->stop();
+    }
+
   protected:
     asio::ssl::context context;
 
@@ -63,7 +67,7 @@ namespace SimpleWeb {
     }
 
     void accept() override {
-      std::shared_ptr<Connection> connection(new Connection(handler_runner, config.timeout_idle, *io_service, context));
+      std::shared_ptr<Connection> connection(new Connection(handler_runner, config.timeout_idle, config.max_handshake_size, *io_service, context));
 
       acceptor->async_accept(connection->socket->lowest_layer(), [this, connection](const error_code &ec) {
         auto lock = connection->handler_runner->continue_lock();

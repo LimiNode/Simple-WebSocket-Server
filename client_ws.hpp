@@ -7,6 +7,7 @@
 #include "utility.hpp"
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <iostream>
 #include <limits>
 #include <list>
@@ -70,8 +71,9 @@ namespace SimpleWeb {
 
     private:
       template <typename... Args>
-      Connection(std::shared_ptr<ScopeRunner> handler_runner_, long timeout_idle, Args &&...args) noexcept
-          : handler_runner(std::move(handler_runner_)), socket(new socket_type(std::forward<Args>(args)...)), read_write_strand(get_executor(socket->lowest_layer())), timeout_idle(timeout_idle), close_sent(false) {}
+      Connection(std::shared_ptr<ScopeRunner> handler_runner_, long timeout_idle, std::size_t max_handshake_size, Args &&...args) noexcept
+          : handler_runner(std::move(handler_runner_)), socket(new socket_type(std::forward<Args>(args)...)), read_write_strand(get_executor(socket->lowest_layer())),
+            handshake_streambuf(max_handshake_size), timeout_idle(timeout_idle), close_sent(false) {}
 
       std::shared_ptr<ScopeRunner> handler_runner;
 
@@ -85,6 +87,7 @@ namespace SimpleWeb {
 
       std::shared_ptr<InMessage> in_message;
       std::shared_ptr<InMessage> fragmented_in_message;
+      asio::streambuf handshake_streambuf;
 
       long timeout_idle;
       Mutex timer_mutex;
@@ -156,7 +159,7 @@ namespace SimpleWeb {
           auto lock = self->handler_runner->continue_lock();
           if(!lock)
             return;
-          asio::async_write(*self->socket, buffer, [self](const error_code &ec, std::size_t /*bytes_transferred*/) {
+          asio::async_write(*self->socket, buffer, bind_executor(self->read_write_strand, [self](const error_code &ec, std::size_t /*bytes_transferred*/) {
             self->set_timeout(); // Set timeout for next send
             auto lock = self->handler_runner->continue_lock();
             if(!lock)
@@ -188,7 +191,7 @@ namespace SimpleWeb {
                   callback(ec);
               }
             }
-          });
+          }));
         });
       }
 
@@ -250,9 +253,8 @@ namespace SimpleWeb {
 
       void send_close(int status, const std::string &reason = "", std::function<void(const error_code &)> callback = nullptr) {
         // Send close only once (in case close is initiated by client)
-        if(close_sent)
+        if(close_sent.exchange(true))
           return;
-        close_sent = true;
 
         auto out_message = std::make_shared<OutMessage>();
 
@@ -288,9 +290,11 @@ namespace SimpleWeb {
       long timeout_request = 0;
       /// Idle timeout. Defaults to no timeout.
       long timeout_idle = 0;
-      /// Maximum size of incoming messages. Defaults to architecture maximum.
+      /// Maximum size of incoming messages. Defaults to 16 MiB.
       /// Exceeding this limit will result in a message_size error code and the connection will be closed.
-      std::size_t max_message_size = (std::numeric_limits<std::size_t>::max)();
+      std::size_t max_message_size = 16 * 1024 * 1024;
+      /// Maximum bytes accepted for the HTTP upgrade response.
+      std::size_t max_handshake_size = 16 * 1024;
       /// Additional header fields to send when performing WebSocket upgrade.
       /// Use this variable to for instance set Sec-WebSocket-Protocol.
       CaseInsensitiveMultimap header;
@@ -317,6 +321,10 @@ namespace SimpleWeb {
       {
         std::lock_guard<std::mutex> lock(start_stop_mutex);
 
+        // Each start owns a new cancellation scope. Late callbacks from an
+        // earlier start retain the old, stopped scope and are ignored.
+        handler_runner = std::shared_ptr<ScopeRunner>(new ScopeRunner());
+
         if(!io_service) {
           io_service = std::make_shared<io_context>();
           internal_io_service = true;
@@ -339,20 +347,26 @@ namespace SimpleWeb {
 
     /// Stop client, and close current connection
     void stop() noexcept {
-      std::lock_guard<std::mutex> lock(start_stop_mutex);
-
+      std::shared_ptr<ScopeRunner> runner;
       {
-        LockGuard lock(connection_mutex);
-        if(connection)
-          connection->close();
+        std::lock_guard<std::mutex> lock(start_stop_mutex);
+        runner = handler_runner;
+
+        {
+          LockGuard lock(connection_mutex);
+          if(connection)
+            connection->close();
+        }
+
+        if(internal_io_service && io_service)
+          io_service->stop();
       }
 
-      if(internal_io_service)
-        io_service->stop();
+      if(runner)
+        runner->stop();
     }
 
     virtual ~SocketClientBase() noexcept {
-      handler_runner->stop();
       stop();
     }
 
@@ -421,12 +435,12 @@ namespace SimpleWeb {
     void upgrade(const std::shared_ptr<Connection> &connection) {
       auto corrected_path = path;
       if(!config.proxy_server.empty() && std::is_same<socket_type, asio::ip::tcp::socket>::value)
-        corrected_path = "http://" + host + ':' + std::to_string(port) + corrected_path;
+        corrected_path = "http://" + format_authority(host, port) + corrected_path;
 
       auto streambuf = std::make_shared<asio::streambuf>();
       std::ostream ostream(streambuf.get());
       ostream << "GET " << corrected_path << " HTTP/1.1\r\n";
-      ostream << "Host: " << host;
+      ostream << "Host: " << (host.find(':') != std::string::npos ? "[" + host + "]" : host);
       if(port != default_port)
         ostream << ':' << std::to_string(port);
       ostream << "\r\n";
@@ -446,6 +460,8 @@ namespace SimpleWeb {
       ostream << "Sec-WebSocket-Version: 13\r\n";
       for(auto &header_field : config.header)
         ostream << header_field.first << ": " << header_field.second << "\r\n";
+      if(!config.proxy_server.empty() && !config.proxy_auth.empty())
+        ostream << "Proxy-Authorization: Basic " << Crypto::Base64::encode(config.proxy_auth) << "\r\n";
       ostream << "\r\n";
 
       try {
@@ -464,7 +480,7 @@ namespace SimpleWeb {
           return;
         if(!ec) {
           connection->set_timeout(this->config.timeout_request);
-          asio::async_read_until(*connection->socket, connection->in_message->streambuf, "\r\n\r\n", [this, connection, nonce_base64](const error_code &ec, std::size_t bytes_transferred) {
+          asio::async_read_until(*connection->socket, connection->handshake_streambuf, "\r\n\r\n", [this, connection, nonce_base64](const error_code &ec, std::size_t bytes_transferred) {
             connection->cancel_timeout();
             auto lock = connection->handler_runner->continue_lock();
             if(!lock)
@@ -474,11 +490,17 @@ namespace SimpleWeb {
               // "After a successful async_read_until operation, the streambuf may contain additional data beyond the delimiter"
               // The chosen solution is to extract lines from the stream directly when parsing the header. What is left of the
               // streambuf (maybe some bytes of a message) is appended to in the next async_read-function
-              std::size_t num_additional_bytes = connection->in_message->streambuf.size() - bytes_transferred;
+              std::size_t num_additional_bytes = connection->handshake_streambuf.size() - bytes_transferred;
 
-              if(!ResponseMessage::parse(*connection->in_message, connection->http_version, connection->status_code, connection->header)) {
+              std::istream handshake_stream(&connection->handshake_streambuf);
+              if(!ResponseMessage::parse(handshake_stream, connection->http_version, connection->status_code, connection->header)) {
                 this->connection_error(connection, make_error_code::make_error_code(errc::protocol_error));
                 return;
+              }
+              if(connection->handshake_streambuf.size() > 0) {
+                const auto bytes = connection->handshake_streambuf.size();
+                connection->in_message->streambuf.commit(asio::buffer_copy(connection->in_message->streambuf.prepare(bytes), connection->handshake_streambuf.data()));
+                connection->handshake_streambuf.consume(bytes);
               }
               if(connection->status_code.compare(0, 4, "101 ") != 0) {
                 this->connection_error(connection, make_error_code::make_error_code(errc::permission_denied));
@@ -526,6 +548,16 @@ namespace SimpleWeb {
 
             connection->in_message->fin_rsv_opcode = first_bytes[0];
 
+            const unsigned char opcode = first_bytes[0] & 0x0f;
+            const std::size_t advertised_length = first_bytes[1] & 127;
+            if(!valid_frame_header(first_bytes[0], connection->fragmented_in_message != nullptr) ||
+               (opcode >= 8 && advertised_length > 125)) {
+              const std::string reason("invalid WebSocket frame");
+              connection->send_close(1002, reason);
+              this->connection_close(connection, 1002, reason);
+              return;
+            }
+
             // Close connection if masked message from server (protocol error)
             if(first_bytes[1] >= 128) {
               const std::string reason("message from server masked");
@@ -534,7 +566,7 @@ namespace SimpleWeb {
               return;
             }
 
-            std::size_t length = (first_bytes[1] & 127);
+            std::size_t length = advertised_length;
 
             if(length == 126) {
               // 2 next bytes is the size of content
@@ -572,10 +604,24 @@ namespace SimpleWeb {
                   std::array<unsigned char, 8> length_bytes;
                   connection->in_message->read(reinterpret_cast<char *>(&length_bytes[0]), 8);
 
-                  std::size_t length = 0;
+                  if(length_bytes[0] & 0x80) {
+                    const std::string reason("invalid WebSocket payload length");
+                    connection->send_close(1002, reason);
+                    this->connection_close(connection, 1002, reason);
+                    return;
+                  }
+                  std::uint64_t wire_length = 0;
                   std::size_t num_bytes = 8;
                   for(std::size_t c = 0; c < num_bytes; c++)
-                    length += static_cast<std::size_t>(length_bytes[c]) << (8 * (num_bytes - 1 - c));
+                    wire_length = (wire_length << 8) | length_bytes[c];
+
+                  if(wire_length > (std::numeric_limits<std::size_t>::max)()) {
+                    const std::string reason("invalid WebSocket payload length");
+                    connection->send_close(1002, reason);
+                    this->connection_close(connection, 1002, reason);
+                    return;
+                  }
+                  std::size_t length = static_cast<std::size_t>(wire_length);
 
                   connection->in_message->length = length;
                   this->read_message_content(connection, updated_num_additional_bytes > 8 ? updated_num_additional_bytes - 8 : 0);
@@ -596,7 +642,15 @@ namespace SimpleWeb {
     }
 
     void read_message_content(const std::shared_ptr<Connection> &connection, std::size_t num_additional_bytes) {
-      if(connection->in_message->length + (connection->fragmented_in_message ? connection->fragmented_in_message->length : 0) > config.max_message_size) {
+      const std::size_t fragmented_length = connection->fragmented_in_message ? connection->fragmented_in_message->length : 0;
+      if((connection->in_message->fin_rsv_opcode & 0x0f) == 8 && connection->in_message->length == 1) {
+        const std::string reason("invalid close frame");
+        connection->send_close(1002, reason);
+        connection_close(connection, 1002, reason);
+        return;
+      }
+      const bool control_frame = (connection->in_message->fin_rsv_opcode & 0x0f) >= 8;
+      if(!control_frame && (connection->in_message->length > config.max_message_size || fragmented_length > config.max_message_size - connection->in_message->length)) {
         connection_error(connection, make_error_code::make_error_code(errc::message_size));
         const int status = 1009;
         const std::string reason = "message too big";
@@ -605,7 +659,7 @@ namespace SimpleWeb {
         return;
       }
       connection->set_timeout();
-      asio::async_read(*connection->socket, connection->in_message->streambuf, asio::transfer_exactly(num_additional_bytes > connection->in_message->length ? 0 : connection->in_message->length - num_additional_bytes), [this, connection, num_additional_bytes](const error_code &ec, std::size_t /*bytes_transferred*/) {
+      asio::async_read(*connection->socket, connection->in_message->streambuf, asio::transfer_exactly(num_additional_bytes > connection->in_message->length ? 0 : connection->in_message->length - num_additional_bytes), bind_executor(connection->read_write_strand, [this, connection, num_additional_bytes](const error_code &ec, std::size_t /*bytes_transferred*/) {
         connection->cancel_timeout();
         auto lock = connection->handler_runner->continue_lock();
         if(!lock)
@@ -706,7 +760,7 @@ namespace SimpleWeb {
         }
         else
           this->connection_error(connection, ec);
-      });
+      }));
     }
 
     void connection_open(const std::shared_ptr<Connection> &connection) const {
@@ -738,7 +792,7 @@ namespace SimpleWeb {
   protected:
     void connect() override {
       LockGuard lock(connection_mutex);
-      auto connection = this->connection = std::shared_ptr<Connection>(new Connection(handler_runner, config.timeout_idle, *io_service));
+      auto connection = this->connection = std::shared_ptr<Connection>(new Connection(handler_runner, config.timeout_idle, config.max_handshake_size, *io_service));
       lock.unlock();
 
       std::pair<std::string, std::string> host_port;
