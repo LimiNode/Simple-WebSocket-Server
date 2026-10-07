@@ -61,9 +61,13 @@ int main() {
       auto b1 = b.continue_lock();
       auto a2 = a.continue_lock();
       ASSERT(a1 != nullptr && b1 != nullptr && a2 != nullptr);
-      b.stop();
-      a2.reset();
+
+      // Remove the middle node to exercise genuinely non-LIFO unlinking.
       b1.reset();
+      a.stop();
+      ASSERT(a.continue_lock() == nullptr);
+
+      a2.reset();
       a1.reset();
     });
     worker.join();

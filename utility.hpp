@@ -482,6 +482,9 @@ namespace SimpleWeb {
     }
 
   public:
+    // A SharedLock is thread-affine: it must be destroyed on the same thread
+    // that obtained it from continue_lock(). Internal handlers already follow
+    // this contract.
     class SharedLock {
       friend class ScopeRunner;
       std::atomic<long> &count;
