@@ -457,39 +457,62 @@ namespace SimpleWeb {
 namespace SimpleWeb {
   /// Makes it possible to for instance cancel Asio handlers without stopping asio::io_service.
   class ScopeRunner {
+    struct LocalScopeEntry {
+      const ScopeRunner *owner;
+      LocalScopeEntry *previous;
+      LocalScopeEntry *next;
+    };
+
     std::atomic<long> count;
     std::atomic<bool> cancelled;
 
-    static std::unordered_map<const ScopeRunner *, std::size_t> &local_scope_counts() noexcept {
-      static thread_local std::unordered_map<const ScopeRunner *, std::size_t> counts;
-      return counts;
+    static LocalScopeEntry *&local_scope_head() noexcept {
+      // Keep TLS trivial. In particular, do not put a non-trivial container
+      // here: some MinGW runtimes have been observed to corrupt TLS cleanup.
+      static thread_local LocalScopeEntry *head = nullptr;
+      return head;
     }
 
-    std::size_t local_scope_count() const noexcept {
-      auto it = local_scope_counts().find(this);
-      return it == local_scope_counts().end() ? 0 : it->second;
+    bool has_local_scope() const noexcept {
+      for(auto entry = local_scope_head(); entry != nullptr; entry = entry->next) {
+        if(entry->owner == this)
+          return true;
+      }
+      return false;
     }
 
   public:
+    // A SharedLock is thread-affine: it must be destroyed on the same thread
+    // that obtained it from continue_lock(). Internal handlers already follow
+    // this contract.
     class SharedLock {
       friend class ScopeRunner;
       std::atomic<long> &count;
       const ScopeRunner *owner;
-      SharedLock(std::atomic<long> &count, const ScopeRunner *owner) noexcept : count(count), owner(owner) {
-        ++ScopeRunner::local_scope_counts()[owner];
+      LocalScopeEntry local_entry;
+
+      SharedLock(std::atomic<long> &count, const ScopeRunner *owner) noexcept : count(count), owner(owner), local_entry{owner, nullptr, nullptr} {
+        auto &head = ScopeRunner::local_scope_head();
+        local_entry.next = head;
+        if(head != nullptr)
+          head->previous = &local_entry;
+        head = &local_entry;
       }
       SharedLock &operator=(const SharedLock &) = delete;
       SharedLock(const SharedLock &) = delete;
 
     public:
       ~SharedLock() noexcept {
+        auto &head = ScopeRunner::local_scope_head();
+        if(local_entry.previous != nullptr)
+          local_entry.previous->next = local_entry.next;
+        else
+          head = local_entry.next;
+        if(local_entry.next != nullptr)
+          local_entry.next->previous = local_entry.previous;
+
+        // Remove the local node before publishing the global count decrement.
         count.fetch_sub(1);
-        auto &counts = ScopeRunner::local_scope_counts();
-        auto it = counts.find(owner);
-        if(it != counts.end()) {
-          if(--it->second == 0)
-            counts.erase(it);
-        }
       }
     };
 
@@ -526,7 +549,7 @@ namespace SimpleWeb {
     /// enclosing callback must return before its owning object is destroyed.
     void stop() noexcept {
       cancelled.store(true);
-      if(local_scope_count() != 0)
+      if(has_local_scope())
         return;
 
       while(count.load() != 0)

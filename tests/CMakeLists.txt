@@ -19,3 +19,8 @@ add_executable(swss_io_test io_test.cpp)
 target_link_libraries(swss_io_test simple-websocket-server)
 set_target_properties(swss_io_test PROPERTIES CXX_STANDARD ${CMAKE_CXX_STANDARD} CXX_STANDARD_REQUIRED ON)
 add_test(swss_io_test swss_io_test)
+
+add_executable(swss_scope_runner_test scope_runner_test.cpp)
+target_link_libraries(swss_scope_runner_test simple-websocket-server)
+set_target_properties(swss_scope_runner_test PROPERTIES CXX_STANDARD ${CMAKE_CXX_STANDARD} CXX_STANDARD_REQUIRED ON)
+add_test(swss_scope_runner_test swss_scope_runner_test)
