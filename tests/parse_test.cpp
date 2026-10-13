@@ -149,6 +149,19 @@ int main() {
   serverTest.parse_request_test();
 
   {
+    SocketServer<WS> invalid_address_server;
+    invalid_address_server.config.address = "not-an-ip-address";
+    bool rejected = false;
+    try {
+      invalid_address_server.start();
+    }
+    catch(const std::exception &) {
+      rejected = true;
+    }
+    ASSERT(rejected);
+  }
+
+  {
     SocketClientTest clientTest("test.org:8080/test");
     ASSERT(clientTest.path == "/test");
     ASSERT(clientTest.host == "test.org");

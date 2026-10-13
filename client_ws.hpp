@@ -151,8 +151,14 @@ namespace SimpleWeb {
       Mutex send_queue_mutex;
       std::list<OutData> send_queue GUARDED_BY(send_queue_mutex);
 
-      void send_from_queue() REQUIRES(send_queue_mutex) {
-        auto buffer = send_queue.begin()->out_message->streambuf.data();
+      void send_from_queue() {
+        asio::const_buffer buffer;
+        {
+          LockGuard lock(send_queue_mutex);
+          if(send_queue.empty())
+            return;
+          buffer = send_queue.begin()->out_message->streambuf.data();
+        }
         auto self = this->shared_from_this();
         set_timeout();
         post(read_write_strand, [self, buffer] {
@@ -170,10 +176,10 @@ namespace SimpleWeb {
                 auto it = self->send_queue.begin();
                 auto callback = std::move(it->callback);
                 self->send_queue.erase(it);
-                if(self->send_queue.size() > 0)
-                  self->send_from_queue();
-
+                const bool has_next = !self->send_queue.empty();
                 lock.unlock();
+                if(has_next)
+                  self->send_from_queue();
                 if(callback)
                   callback(ec);
               }
@@ -236,9 +242,13 @@ namespace SimpleWeb {
         for(std::size_t c = 0; c < length; c++)
           out_header_and_message->put(out_message->get() ^ mask[c % 4]);
 
-        LockGuard lock(send_queue_mutex);
-        send_queue.emplace_back(std::move(out_header_and_message), std::move(callback));
-        if(send_queue.size() == 1)
+        bool start_send = false;
+        {
+          LockGuard lock(send_queue_mutex);
+          send_queue.emplace_back(std::move(out_header_and_message), std::move(callback));
+          start_send = send_queue.size() == 1;
+        }
+        if(start_send)
           send_from_queue();
       }
 
@@ -383,8 +393,8 @@ namespace SimpleWeb {
     unsigned short default_port;
     std::string path;
 
-    Mutex connection_mutex;
-    std::shared_ptr<Connection> connection GUARDED_BY(connection_mutex);
+    mutable Mutex connection_mutex;
+    mutable std::shared_ptr<Connection> connection GUARDED_BY(connection_mutex);
 
     std::shared_ptr<ScopeRunner> handler_runner;
 
@@ -769,11 +779,22 @@ namespace SimpleWeb {
     }
 
     void connection_close(const std::shared_ptr<Connection> &connection, int status, const std::string &reason) const {
+      {
+        LockGuard lock(connection_mutex);
+        if(this->connection == connection)
+          this->connection.reset();
+      }
       if(on_close)
         on_close(connection, status, reason);
     }
 
     void connection_error(const std::shared_ptr<Connection> &connection, const error_code &ec) const {
+      connection->close();
+      {
+        LockGuard lock(connection_mutex);
+        if(this->connection == connection)
+          this->connection.reset();
+      }
       if(on_error)
         on_error(connection, ec);
     }

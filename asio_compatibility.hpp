@@ -51,8 +51,12 @@ namespace SimpleWeb {
   inline void restart(io_context &context) noexcept {
     context.restart();
   }
+  inline asio::ip::address make_address(const std::string &str, error_code &ec) noexcept {
+    return asio::ip::make_address(str, ec);
+  }
   inline asio::ip::address make_address(const std::string &str) noexcept {
-    return asio::ip::make_address(str);
+    error_code ec;
+    return make_address(str, ec);
   }
   template <typename socket_type, typename duration_type>
   inline std::unique_ptr<asio::steady_timer> make_steady_timer(socket_type &socket, std::chrono::duration<duration_type> duration) {
@@ -90,8 +94,12 @@ namespace SimpleWeb {
   inline void restart(io_context &context) noexcept {
     context.reset();
   }
+  inline asio::ip::address make_address(const std::string &str, error_code &ec) noexcept {
+    return asio::ip::address::from_string(str, ec);
+  }
   inline asio::ip::address make_address(const std::string &str) noexcept {
-    return asio::ip::address::from_string(str);
+    error_code ec;
+    return make_address(str, ec);
   }
   template <typename socket_type, typename duration_type>
   inline std::unique_ptr<asio::steady_timer> make_steady_timer(socket_type &socket, std::chrono::duration<duration_type> duration) {
