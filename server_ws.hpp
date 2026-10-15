@@ -999,7 +999,7 @@ namespace SimpleWeb {
           return;
         }
         // Immediately start accepting a new connection (if io_service hasn't been stopped)
-        if(ec != error::operation_aborted && !stopping.load())
+        if(ec != error::operation_aborted && !stopping.load() && accepting.load())
           accept(connection->handler_runner);
 
         if(!ec) {
