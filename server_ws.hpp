@@ -445,6 +445,10 @@ namespace SimpleWeb {
       auto port = acceptor->local_endpoint().port();
 
       acceptor->listen();
+      {
+        std::lock_guard<std::mutex> accept_lock(accept_mutex);
+        accepting.store(true);
+      }
       accept(handler_runner);
 
       if(internal_io_service && io_service->stopped())
@@ -488,9 +492,13 @@ namespace SimpleWeb {
         stopping.store(true);
         runner = handler_runner;
 
-        if(acceptor) {
-          error_code ec;
-          acceptor->close(ec);
+        {
+          std::lock_guard<std::mutex> accept_lock(accept_mutex);
+          accepting.store(false);
+          if(acceptor) {
+            error_code ec;
+            acceptor->close(ec);
+          }
         }
 
         {
@@ -518,6 +526,9 @@ namespace SimpleWeb {
 
     /// Stop accepting new connections
     void stop_accept() noexcept {
+      std::lock_guard<std::mutex> lifecycle_lock(start_stop_mutex);
+      std::lock_guard<std::mutex> accept_lock(accept_mutex);
+      accepting.store(false);
       if(acceptor) {
         error_code ec;
         acceptor->close(ec);
@@ -579,6 +590,8 @@ namespace SimpleWeb {
 
     std::unique_ptr<asio::ip::tcp::acceptor> acceptor;
     std::vector<std::thread> threads;
+    std::mutex accept_mutex;
+    std::atomic<bool> accepting{false};
 
     // Tracks sockets from accept() through the HTTP/TLS handshake. Established
     // sockets are also kept in their endpoint set, but pending handshakes are
@@ -620,7 +633,7 @@ namespace SimpleWeb {
         connection->cancel_timeout();
         auto lock = connection->handler_runner->continue_lock();
         if(!lock) {
-          reject_connection(connection);
+          connection->close();
           return;
         }
         if(!ec) {
@@ -681,7 +694,7 @@ namespace SimpleWeb {
             connection->cancel_timeout();
             auto lock = connection->handler_runner->continue_lock();
             if(!lock) {
-              reject_connection(connection);
+              connection->close();
               return;
             }
             if(status_code != StatusCode::information_switching_protocols)
@@ -974,14 +987,15 @@ namespace SimpleWeb {
 
   protected:
     void accept(const std::shared_ptr<ScopeRunner> &runner) override {
-      if(stopping.load())
+      std::unique_lock<std::mutex> accept_lock(accept_mutex);
+      if(stopping.load() || !accepting.load())
         return;
       std::shared_ptr<Connection> connection(new Connection(runner, config.timeout_idle, config.max_handshake_size, *io_service));
 
       acceptor->async_accept(*connection->socket, [this, connection](const error_code &ec) {
         auto lock = connection->handler_runner->continue_lock();
         if(!lock) {
-          unregister_connection(connection);
+          connection->close();
           return;
         }
         // Immediately start accepting a new connection (if io_service hasn't been stopped)

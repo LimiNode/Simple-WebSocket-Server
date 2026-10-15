@@ -67,14 +67,15 @@ namespace SimpleWeb {
     }
 
     void accept(const std::shared_ptr<ScopeRunner> &runner) override {
-      if(stopping.load())
+      std::unique_lock<std::mutex> accept_lock(accept_mutex);
+      if(stopping.load() || !accepting.load())
         return;
       std::shared_ptr<Connection> connection(new Connection(runner, config.timeout_idle, config.max_handshake_size, *io_service, context));
 
       acceptor->async_accept(connection->socket->lowest_layer(), [this, connection](const error_code &ec) {
         auto lock = connection->handler_runner->continue_lock();
         if(!lock) {
-          unregister_connection(connection);
+          connection->close();
           return;
         }
         // Immediately start accepting a new connection (if io_service hasn't been stopped)
@@ -95,7 +96,7 @@ namespace SimpleWeb {
             connection->cancel_timeout();
             auto lock = connection->handler_runner->continue_lock();
             if(!lock) {
-              reject_connection(connection);
+              connection->close();
               return;
             }
             if(!ec)
