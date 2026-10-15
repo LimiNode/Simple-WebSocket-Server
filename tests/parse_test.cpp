@@ -10,7 +10,7 @@ class SocketServerTest : public SocketServerBase<WS> {
 public:
   SocketServerTest() : SocketServerBase<WS>::SocketServerBase(8080) {}
 
-  void accept() {}
+  void accept(const std::shared_ptr<ScopeRunner> &) {}
 
   void parse_request_test() {
     std::shared_ptr<Connection> connection(new Connection(handler_runner, 0, config.max_handshake_size, *io_service));

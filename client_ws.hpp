@@ -364,8 +364,10 @@ namespace SimpleWeb {
 
         {
           LockGuard lock(connection_mutex);
-          if(connection)
+          if(connection) {
             connection->close();
+            connection.reset();
+          }
         }
 
         if(internal_io_service && io_service)

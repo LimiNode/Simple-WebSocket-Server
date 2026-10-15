@@ -398,6 +398,7 @@ namespace SimpleWeb {
     void start(const std::function<void(unsigned short /*port*/)> &callback = nullptr) {
       std::unique_lock<std::mutex> lock(start_stop_mutex);
 
+      stopping.store(false);
       handler_runner = std::shared_ptr<ScopeRunner>(new ScopeRunner());
 
       asio::ip::tcp::endpoint endpoint;
@@ -444,7 +445,7 @@ namespace SimpleWeb {
       auto port = acceptor->local_endpoint().port();
 
       acceptor->listen();
-      accept();
+      accept(handler_runner);
 
       if(internal_io_service && io_service->stopped())
         restart(*io_service);
@@ -484,6 +485,7 @@ namespace SimpleWeb {
       {
         std::lock_guard<std::mutex> lock(start_stop_mutex);
 
+        stopping.store(true);
         runner = handler_runner;
 
         if(acceptor) {
@@ -553,8 +555,16 @@ namespace SimpleWeb {
      * }
      */
     void upgrade(const std::shared_ptr<Connection> &connection) {
-      register_connection(connection);
-      connection->handler_runner = handler_runner;
+      std::shared_ptr<ScopeRunner> runner;
+      {
+        std::lock_guard<std::mutex> lock(start_stop_mutex);
+        runner = handler_runner;
+      }
+      if(!register_connection(connection)) {
+        connection->close();
+        return;
+      }
+      connection->handler_runner = std::move(runner);
       connection->timeout_idle = config.timeout_idle;
       write_handshake(connection);
     }
@@ -577,15 +587,26 @@ namespace SimpleWeb {
     mutable std::unordered_set<std::shared_ptr<Connection>> connections GUARDED_BY(connections_mutex);
 
     std::shared_ptr<ScopeRunner> handler_runner;
+    std::atomic<bool> stopping{false};
 
     SocketServerBase(unsigned short port) noexcept : config(port), handler_runner(new ScopeRunner()) {}
 
     virtual void after_bind() {}
-    virtual void accept() = 0;
+    virtual void accept(const std::shared_ptr<ScopeRunner> &runner) = 0;
 
-    void register_connection(const std::shared_ptr<Connection> &connection) {
+    bool register_connection(const std::shared_ptr<Connection> &connection) {
+      if(stopping.load())
+        return false;
       LockGuard lock(connections_mutex);
+      if(stopping.load())
+        return false;
       connections.insert(connection);
+      return true;
+    }
+
+    void reject_connection(const std::shared_ptr<Connection> &connection) const {
+      connection->close();
+      unregister_connection(connection);
     }
 
     void unregister_connection(const std::shared_ptr<Connection> &connection) const {
@@ -598,20 +619,20 @@ namespace SimpleWeb {
       asio::async_read_until(*connection->socket, connection->handshake_streambuf, "\r\n\r\n", [this, connection](const error_code &ec, std::size_t /*bytes_transferred*/) {
         connection->cancel_timeout();
         auto lock = connection->handler_runner->continue_lock();
-        if(!lock)
+        if(!lock) {
+          reject_connection(connection);
           return;
+        }
         if(!ec) {
           std::istream istream(&connection->handshake_streambuf);
           if(RequestMessage::parse(istream, connection->method, connection->path, connection->query_string, connection->http_version, connection->header))
             write_handshake(connection);
           else {
-            connection->close();
-            unregister_connection(connection);
+            reject_connection(connection);
           }
         }
         else {
-          connection->close();
-          unregister_connection(connection);
+          reject_connection(connection);
         }
       });
     }
@@ -659,8 +680,12 @@ namespace SimpleWeb {
           asio::async_write(*connection->socket, *streambuf, [this, connection, streambuf, &regex_endpoint, status_code](const error_code &ec, std::size_t /*bytes_transferred*/) {
             connection->cancel_timeout();
             auto lock = connection->handler_runner->continue_lock();
-            if(!lock)
+            if(!lock) {
+              reject_connection(connection);
               return;
+            }
+            if(status_code != StatusCode::information_switching_protocols)
+              reject_connection(connection);
             if(status_code != StatusCode::information_switching_protocols)
               return;
 
@@ -679,6 +704,7 @@ namespace SimpleWeb {
           return;
         }
       }
+      reject_connection(connection);
     }
 
     void read_message(const std::shared_ptr<Connection> &connection, Endpoint &endpoint) const {
@@ -947,26 +973,32 @@ namespace SimpleWeb {
     }
 
   protected:
-    void accept() override {
-      std::shared_ptr<Connection> connection(new Connection(handler_runner, config.timeout_idle, config.max_handshake_size, *io_service));
-      register_connection(connection);
+    void accept(const std::shared_ptr<ScopeRunner> &runner) override {
+      if(stopping.load())
+        return;
+      std::shared_ptr<Connection> connection(new Connection(runner, config.timeout_idle, config.max_handshake_size, *io_service));
 
       acceptor->async_accept(*connection->socket, [this, connection](const error_code &ec) {
         auto lock = connection->handler_runner->continue_lock();
-        if(!lock)
+        if(!lock) {
+          unregister_connection(connection);
           return;
+        }
         // Immediately start accepting a new connection (if io_service hasn't been stopped)
-        if(ec != error::operation_aborted)
-          accept();
+        if(ec != error::operation_aborted && !stopping.load())
+          accept(connection->handler_runner);
 
         if(!ec) {
+          if(!register_connection(connection)) {
+            connection->close();
+            return;
+          }
+
           asio::ip::tcp::no_delay option(true);
           connection->socket->set_option(option);
 
           read_handshake(connection);
         }
-        else
-          unregister_connection(connection);
       });
     }
   };
