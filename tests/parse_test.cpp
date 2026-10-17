@@ -10,7 +10,7 @@ class SocketServerTest : public SocketServerBase<WS> {
 public:
   SocketServerTest() : SocketServerBase<WS>::SocketServerBase(8080) {}
 
-  void accept() {}
+  void accept(const std::shared_ptr<ScopeRunner> &) {}
 
   void parse_request_test() {
     std::shared_ptr<Connection> connection(new Connection(handler_runner, 0, config.max_handshake_size, *io_service));
@@ -147,6 +147,19 @@ int main() {
   serverTest.io_service = std::make_shared<io_context>();
 
   serverTest.parse_request_test();
+
+  {
+    SocketServer<WS> invalid_address_server;
+    invalid_address_server.config.address = "not-an-ip-address";
+    bool rejected = false;
+    try {
+      invalid_address_server.start();
+    }
+    catch(const std::exception &) {
+      rejected = true;
+    }
+    ASSERT(rejected);
+  }
 
   {
     SocketClientTest clientTest("test.org:8080/test");

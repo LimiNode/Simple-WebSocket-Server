@@ -24,3 +24,33 @@ add_executable(swss_scope_runner_test scope_runner_test.cpp)
 target_link_libraries(swss_scope_runner_test simple-websocket-server)
 set_target_properties(swss_scope_runner_test PROPERTIES CXX_STANDARD ${CMAKE_CXX_STANDARD} CXX_STANDARD_REQUIRED ON)
 add_test(swss_scope_runner_test swss_scope_runner_test)
+
+add_executable(swss_lifecycle_test lifecycle_test.cpp)
+target_link_libraries(swss_lifecycle_test simple-websocket-server)
+set_target_properties(swss_lifecycle_test PROPERTIES CXX_STANDARD ${CMAKE_CXX_STANDARD} CXX_STANDARD_REQUIRED ON)
+add_test(swss_lifecycle_test swss_lifecycle_test)
+
+add_executable(swss_client_error_test client_error_test.cpp)
+target_link_libraries(swss_client_error_test simple-websocket-server)
+set_target_properties(swss_client_error_test PROPERTIES CXX_STANDARD ${CMAKE_CXX_STANDARD} CXX_STANDARD_REQUIRED ON)
+add_test(swss_client_error_test swss_client_error_test)
+
+add_executable(swss_destruction_test destruction_test.cpp)
+target_link_libraries(swss_destruction_test simple-websocket-server)
+set_target_properties(swss_destruction_test PROPERTIES CXX_STANDARD ${CMAKE_CXX_STANDARD} CXX_STANDARD_REQUIRED ON)
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/data/server_cert.pem ${CMAKE_CURRENT_BINARY_DIR}/server_cert.pem COPYONLY)
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/data/server_key.pem ${CMAKE_CURRENT_BINARY_DIR}/server_key.pem COPYONLY)
+add_test(swss_destruction_test swss_destruction_test)
+
+add_executable(swss_wss_destruction_test wss_destruction_test.cpp)
+target_link_libraries(swss_wss_destruction_test simple-websocket-server)
+set_target_properties(swss_wss_destruction_test PROPERTIES CXX_STANDARD ${CMAKE_CXX_STANDARD} CXX_STANDARD_REQUIRED ON)
+add_test(NAME swss_wss_destruction_test
+         COMMAND swss_wss_destruction_test
+                 ${CMAKE_CURRENT_BINARY_DIR}/server_cert.pem
+                 ${CMAKE_CURRENT_BINARY_DIR}/server_key.pem)
+
+add_executable(swss_stop_accept_test stop_accept_test.cpp)
+target_link_libraries(swss_stop_accept_test simple-websocket-server)
+set_target_properties(swss_stop_accept_test PROPERTIES CXX_STANDARD ${CMAKE_CXX_STANDARD} CXX_STANDARD_REQUIRED ON)
+add_test(swss_stop_accept_test swss_stop_accept_test)

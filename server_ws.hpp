@@ -164,9 +164,15 @@ namespace SimpleWeb {
       Mutex send_queue_mutex;
       std::list<OutData> send_queue GUARDED_BY(send_queue_mutex);
 
-      /// send_queue_mutex must be locked here
-      void send_from_queue() REQUIRES(send_queue_mutex) {
-        std::array<asio::const_buffer, 2> buffers{send_queue.begin()->out_header->streambuf.data(), send_queue.begin()->out_message->streambuf.data()};
+      void send_from_queue() {
+        std::array<asio::const_buffer, 2> buffers;
+        {
+          LockGuard lock(send_queue_mutex);
+          if(send_queue.empty())
+            return;
+          buffers[0] = send_queue.begin()->out_header->streambuf.data();
+          buffers[1] = send_queue.begin()->out_message->streambuf.data();
+        }
         auto self = this->shared_from_this();
         set_timeout();
         post(read_write_strand, [self, buffers] {
@@ -184,10 +190,10 @@ namespace SimpleWeb {
                 auto it = self->send_queue.begin();
                 auto callback = std::move(it->callback);
                 self->send_queue.erase(it);
-                if(self->send_queue.size() > 0)
-                  self->send_from_queue();
-
+                const bool has_next = !self->send_queue.empty();
                 lock.unlock();
+                if(has_next)
+                  self->send_from_queue();
                 if(callback)
                   callback(ec);
               }
@@ -236,9 +242,13 @@ namespace SimpleWeb {
         else
           out_header->put(static_cast<char>(length));
 
-        LockGuard lock(send_queue_mutex);
-        send_queue.emplace_back(std::move(out_header), std::move(out_message), std::move(callback));
-        if(send_queue.size() == 1)
+        bool start_send = false;
+        {
+          LockGuard lock(send_queue_mutex);
+          send_queue.emplace_back(std::move(out_header), std::move(out_message), std::move(callback));
+          start_send = send_queue.size() == 1;
+        }
+        if(start_send)
           send_from_queue();
       }
 
@@ -388,11 +398,17 @@ namespace SimpleWeb {
     void start(const std::function<void(unsigned short /*port*/)> &callback = nullptr) {
       std::unique_lock<std::mutex> lock(start_stop_mutex);
 
+      stopping.store(false);
       handler_runner = std::shared_ptr<ScopeRunner>(new ScopeRunner());
 
       asio::ip::tcp::endpoint endpoint;
-      if(!config.address.empty())
-        endpoint = asio::ip::tcp::endpoint(make_address(config.address), config.port);
+      if(!config.address.empty()) {
+        error_code ec;
+        auto address = make_address(config.address, ec);
+        if(ec)
+          throw system_error(ec);
+        endpoint = asio::ip::tcp::endpoint(address, config.port);
+      }
       else
         endpoint = asio::ip::tcp::endpoint(asio::ip::tcp::v6(), config.port);
 
@@ -429,7 +445,11 @@ namespace SimpleWeb {
       auto port = acceptor->local_endpoint().port();
 
       acceptor->listen();
-      accept();
+      {
+        std::lock_guard<std::mutex> accept_lock(accept_mutex);
+        accepting.store(true);
+      }
+      accept(handler_runner);
 
       if(internal_io_service && io_service->stopped())
         restart(*io_service);
@@ -464,34 +484,51 @@ namespace SimpleWeb {
 
     /// Stop accepting new connections, and close current connections
     void stop() noexcept {
+      std::unordered_set<std::shared_ptr<Connection>> connections_to_close;
+      std::shared_ptr<ScopeRunner> runner;
       {
         std::lock_guard<std::mutex> lock(start_stop_mutex);
 
-        if(acceptor) {
-          error_code ec;
-          acceptor->close(ec);
+        stopping.store(true);
+        runner = handler_runner;
 
-          for(auto &pair : endpoint) {
-            LockGuard lock(pair.second.connections_mutex);
-            for(auto &connection : pair.second.connections)
-              connection->close();
-            pair.second.connections.clear();
+        {
+          std::lock_guard<std::mutex> accept_lock(accept_mutex);
+          accepting.store(false);
+          if(acceptor) {
+            error_code ec;
+            acceptor->close(ec);
           }
-
-          if(internal_io_service)
-            io_service->stop();
         }
+
+        {
+          LockGuard lock(connections_mutex);
+          connections_to_close.swap(connections);
+        }
+        for(auto &connection : connections_to_close)
+          connection->close();
+
+        for(auto &pair : endpoint) {
+          LockGuard lock(pair.second.connections_mutex);
+          pair.second.connections.clear();
+        }
+
+        if(internal_io_service && io_service)
+          io_service->stop();
       }
 
       // Prevent queued handlers from dereferencing this server after destruction.
       // ScopeRunner waits for handlers which already entered a callback and rejects
       // all callbacks which have not started yet.
-      if(handler_runner)
-        handler_runner->stop();
+      if(runner)
+        runner->stop();
     }
 
     /// Stop accepting new connections
     void stop_accept() noexcept {
+      std::lock_guard<std::mutex> lifecycle_lock(start_stop_mutex);
+      std::lock_guard<std::mutex> accept_lock(accept_mutex);
+      accepting.store(false);
       if(acceptor) {
         error_code ec;
         acceptor->close(ec);
@@ -529,7 +566,16 @@ namespace SimpleWeb {
      * }
      */
     void upgrade(const std::shared_ptr<Connection> &connection) {
-      connection->handler_runner = handler_runner;
+      std::shared_ptr<ScopeRunner> runner;
+      {
+        std::lock_guard<std::mutex> lock(start_stop_mutex);
+        runner = handler_runner;
+      }
+      if(!register_connection(connection)) {
+        connection->close();
+        return;
+      }
+      connection->handler_runner = std::move(runner);
       connection->timeout_idle = config.timeout_idle;
       write_handshake(connection);
     }
@@ -544,25 +590,62 @@ namespace SimpleWeb {
 
     std::unique_ptr<asio::ip::tcp::acceptor> acceptor;
     std::vector<std::thread> threads;
+    std::mutex accept_mutex;
+    std::atomic<bool> accepting{false};
+
+    // Tracks sockets from accept() through the HTTP/TLS handshake. Established
+    // sockets are also kept in their endpoint set, but pending handshakes are
+    // not associated with an endpoint yet and must still be closed by stop().
+    mutable Mutex connections_mutex;
+    mutable std::unordered_set<std::shared_ptr<Connection>> connections GUARDED_BY(connections_mutex);
 
     std::shared_ptr<ScopeRunner> handler_runner;
+    std::atomic<bool> stopping{false};
 
     SocketServerBase(unsigned short port) noexcept : config(port), handler_runner(new ScopeRunner()) {}
 
     virtual void after_bind() {}
-    virtual void accept() = 0;
+    virtual void accept(const std::shared_ptr<ScopeRunner> &runner) = 0;
+
+    bool register_connection(const std::shared_ptr<Connection> &connection) {
+      if(stopping.load())
+        return false;
+      LockGuard lock(connections_mutex);
+      if(stopping.load())
+        return false;
+      connections.insert(connection);
+      return true;
+    }
+
+    void reject_connection(const std::shared_ptr<Connection> &connection) const {
+      connection->close();
+      unregister_connection(connection);
+    }
+
+    void unregister_connection(const std::shared_ptr<Connection> &connection) const {
+      LockGuard lock(connections_mutex);
+      connections.erase(connection);
+    }
 
     void read_handshake(const std::shared_ptr<Connection> &connection) {
       connection->set_timeout(config.timeout_request);
       asio::async_read_until(*connection->socket, connection->handshake_streambuf, "\r\n\r\n", [this, connection](const error_code &ec, std::size_t /*bytes_transferred*/) {
         connection->cancel_timeout();
         auto lock = connection->handler_runner->continue_lock();
-        if(!lock)
+        if(!lock) {
+          connection->close();
           return;
+        }
         if(!ec) {
           std::istream istream(&connection->handshake_streambuf);
           if(RequestMessage::parse(istream, connection->method, connection->path, connection->query_string, connection->http_version, connection->header))
             write_handshake(connection);
+          else {
+            reject_connection(connection);
+          }
+        }
+        else {
+          reject_connection(connection);
         }
       });
     }
@@ -610,8 +693,12 @@ namespace SimpleWeb {
           asio::async_write(*connection->socket, *streambuf, [this, connection, streambuf, &regex_endpoint, status_code](const error_code &ec, std::size_t /*bytes_transferred*/) {
             connection->cancel_timeout();
             auto lock = connection->handler_runner->continue_lock();
-            if(!lock)
+            if(!lock) {
+              connection->close();
               return;
+            }
+            if(status_code != StatusCode::information_switching_protocols)
+              reject_connection(connection);
             if(status_code != StatusCode::information_switching_protocols)
               return;
 
@@ -630,6 +717,7 @@ namespace SimpleWeb {
           return;
         }
       }
+      reject_connection(connection);
     }
 
     void read_message(const std::shared_ptr<Connection> &connection, Endpoint &endpoint) const {
@@ -861,6 +949,7 @@ namespace SimpleWeb {
     }
 
     void connection_close(const std::shared_ptr<Connection> &connection, Endpoint &endpoint, int status, const std::string &reason) const {
+      unregister_connection(connection);
       {
         LockGuard lock(endpoint.connections_mutex);
         endpoint.connections.erase(connection);
@@ -871,6 +960,8 @@ namespace SimpleWeb {
     }
 
     void connection_error(const std::shared_ptr<Connection> &connection, Endpoint &endpoint, const error_code &ec) const {
+      connection->close();
+      unregister_connection(connection);
       {
         LockGuard lock(endpoint.connections_mutex);
         endpoint.connections.erase(connection);
@@ -895,18 +986,28 @@ namespace SimpleWeb {
     }
 
   protected:
-    void accept() override {
-      std::shared_ptr<Connection> connection(new Connection(handler_runner, config.timeout_idle, config.max_handshake_size, *io_service));
+    void accept(const std::shared_ptr<ScopeRunner> &runner) override {
+      std::unique_lock<std::mutex> accept_lock(accept_mutex);
+      if(stopping.load() || !accepting.load())
+        return;
+      std::shared_ptr<Connection> connection(new Connection(runner, config.timeout_idle, config.max_handshake_size, *io_service));
 
       acceptor->async_accept(*connection->socket, [this, connection](const error_code &ec) {
         auto lock = connection->handler_runner->continue_lock();
-        if(!lock)
+        if(!lock) {
+          connection->close();
           return;
+        }
         // Immediately start accepting a new connection (if io_service hasn't been stopped)
-        if(ec != error::operation_aborted)
-          accept();
+        if(ec != error::operation_aborted && !stopping.load() && accepting.load())
+          accept(connection->handler_runner);
 
         if(!ec) {
+          if(!register_connection(connection)) {
+            connection->close();
+            return;
+          }
+
           asio::ip::tcp::no_delay option(true);
           connection->socket->set_option(option);
 
