@@ -54,3 +54,8 @@ add_executable(swss_stop_accept_test stop_accept_test.cpp)
 target_link_libraries(swss_stop_accept_test simple-websocket-server)
 set_target_properties(swss_stop_accept_test PROPERTIES CXX_STANDARD ${CMAKE_CXX_STANDARD} CXX_STANDARD_REQUIRED ON)
 add_test(swss_stop_accept_test swss_stop_accept_test)
+
+add_executable(swss_stop_generation_test stop_generation_test.cpp)
+target_link_libraries(swss_stop_generation_test simple-websocket-server)
+set_target_properties(swss_stop_generation_test PROPERTIES CXX_STANDARD ${CMAKE_CXX_STANDARD} CXX_STANDARD_REQUIRED ON)
+add_test(swss_stop_generation_test swss_stop_generation_test)

@@ -396,7 +396,7 @@ namespace SimpleWeb {
     /// The callback argument is called after the server is accepting connections,
     /// where its parameter contains the assigned port.
     void start(const std::function<void(unsigned short /*port*/)> &callback = nullptr) {
-      std::unique_lock<std::mutex> lock(start_stop_mutex);
+      std::unique_lock<std::recursive_mutex> lock(start_stop_mutex);
 
       stopping.store(false);
       handler_runner = std::shared_ptr<ScopeRunner>(new ScopeRunner());
@@ -487,7 +487,7 @@ namespace SimpleWeb {
       std::unordered_set<std::shared_ptr<Connection>> connections_to_close;
       std::shared_ptr<ScopeRunner> runner;
       {
-        std::lock_guard<std::mutex> lock(start_stop_mutex);
+        std::lock_guard<std::recursive_mutex> lock(start_stop_mutex);
 
         stopping.store(true);
         runner = handler_runner;
@@ -526,7 +526,7 @@ namespace SimpleWeb {
 
     /// Stop accepting new connections
     void stop_accept() noexcept {
-      std::lock_guard<std::mutex> lifecycle_lock(start_stop_mutex);
+      std::lock_guard<std::recursive_mutex> lifecycle_lock(start_stop_mutex);
       std::lock_guard<std::mutex> accept_lock(accept_mutex);
       accepting.store(false);
       if(acceptor) {
@@ -568,14 +568,14 @@ namespace SimpleWeb {
     void upgrade(const std::shared_ptr<Connection> &connection) {
       std::shared_ptr<ScopeRunner> runner;
       {
-        std::lock_guard<std::mutex> lock(start_stop_mutex);
+        std::lock_guard<std::recursive_mutex> lock(start_stop_mutex);
         runner = handler_runner;
+        connection->handler_runner = runner;
       }
       if(!register_connection(connection)) {
         connection->close();
         return;
       }
-      connection->handler_runner = std::move(runner);
       connection->timeout_idle = config.timeout_idle;
       write_handshake(connection);
     }
@@ -584,7 +584,10 @@ namespace SimpleWeb {
     std::shared_ptr<io_context> io_service;
 
   protected:
-    std::mutex start_stop_mutex;
+    // Recursive because user callbacks may call stop() on their owning server.
+    // The lock is held while publishing a connection and invoking on_open so
+    // an external stop cannot clear the registry between those operations.
+    mutable std::recursive_mutex start_stop_mutex;
 
     bool internal_io_service = false;
 
@@ -608,10 +611,11 @@ namespace SimpleWeb {
     virtual void accept(const std::shared_ptr<ScopeRunner> &runner) = 0;
 
     bool register_connection(const std::shared_ptr<Connection> &connection) {
-      if(stopping.load())
+      std::lock_guard<std::recursive_mutex> lifecycle_lock(start_stop_mutex);
+      if(stopping.load() || handler_runner != connection->handler_runner)
         return false;
       LockGuard lock(connections_mutex);
-      if(stopping.load())
+      if(stopping.load() || handler_runner != connection->handler_runner)
         return false;
       connections.insert(connection);
       return true;
@@ -708,8 +712,8 @@ namespace SimpleWeb {
                 connection->streambuf.commit(asio::buffer_copy(connection->streambuf.prepare(bytes), connection->handshake_streambuf.data()));
                 connection->handshake_streambuf.consume(bytes);
               }
-              connection_open(connection, regex_endpoint.second);
-              read_message(connection, regex_endpoint.second);
+              if(connection_open(connection, regex_endpoint.second))
+                read_message(connection, regex_endpoint.second);
             }
             else
               connection_error(connection, regex_endpoint.second, ec);
@@ -938,7 +942,14 @@ namespace SimpleWeb {
       }));
     }
 
-    void connection_open(const std::shared_ptr<Connection> &connection, Endpoint &endpoint) const {
+    bool connection_open(const std::shared_ptr<Connection> &connection, Endpoint &endpoint) const {
+      std::lock_guard<std::recursive_mutex> lifecycle_lock(start_stop_mutex);
+      if(stopping.load() || handler_runner != connection->handler_runner) {
+        connection->close();
+        unregister_connection(connection);
+        return false;
+      }
+
       {
         LockGuard lock(endpoint.connections_mutex);
         endpoint.connections.insert(connection);
@@ -946,6 +957,20 @@ namespace SimpleWeb {
 
       if(endpoint.on_open)
         endpoint.on_open(connection);
+
+      // on_open may synchronously stop() or start() the server. In either
+      // case this connection belongs to a cancelled generation and must not
+      // continue into read_message().
+      if(stopping.load() || handler_runner != connection->handler_runner) {
+        connection->close();
+        unregister_connection(connection);
+        {
+          LockGuard lock(endpoint.connections_mutex);
+          endpoint.connections.erase(connection);
+        }
+        return false;
+      }
+      return true;
     }
 
     void connection_close(const std::shared_ptr<Connection> &connection, Endpoint &endpoint, int status, const std::string &reason) const {
