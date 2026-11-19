@@ -1005,6 +1005,10 @@ namespace SimpleWeb {
         return false;
       }
 
+      // This final generation check admits on_open. A concurrent stop() may
+      // begin before the callback is invoked, but the handler is already
+      // admitted and the external stop() barrier waits for it through
+      // ScopeRunner. Cancellation before this point suppresses the callback.
       if(endpoint.on_open)
         endpoint.on_open(connection);
 
