@@ -91,12 +91,17 @@ namespace SimpleWeb {
       regex::smatch path_match;
 
     private:
+      enum class PublicationState : unsigned char { pending, opened, cancelled };
+
       template <typename... Args>
       Connection(std::shared_ptr<ScopeRunner> handler_runner_, long timeout_idle, std::size_t max_handshake_size, Args &&...args) noexcept
           : handler_runner(std::move(handler_runner_)), socket(new socket_type(std::forward<Args>(args)...)), read_write_strand(get_executor(socket->lowest_layer())),
             handshake_streambuf(max_handshake_size), timeout_idle(timeout_idle), close_sent(false) {}
 
       std::shared_ptr<ScopeRunner> handler_runner;
+      // This gate is independent from the server lifecycle mutex. It lets
+      // stop() cancel a handshake without holding a lock through callbacks.
+      std::atomic<PublicationState> publication_state{PublicationState::pending};
 
       std::unique_ptr<socket_type> socket; // Socket must be unique_ptr since asio::ssl::stream<asio::ip::tcp::socket> is not movable
 
@@ -116,6 +121,25 @@ namespace SimpleWeb {
       std::unique_ptr<asio::steady_timer> timer GUARDED_BY(timer_mutex);
 
       std::atomic<bool> close_sent;
+
+      bool try_publish_open() noexcept {
+        auto expected = PublicationState::pending;
+        return publication_state.compare_exchange_strong(expected, PublicationState::opened);
+      }
+
+      void cancel_publication() noexcept {
+        auto state = publication_state.load();
+        while(state != PublicationState::cancelled && !publication_state.compare_exchange_weak(state, PublicationState::cancelled)) {
+        }
+      }
+
+      bool is_opened() const noexcept {
+        return publication_state.load() == PublicationState::opened;
+      }
+
+      bool is_pending() const noexcept {
+        return publication_state.load() == PublicationState::pending;
+      }
 
       asio::ip::tcp::endpoint endpoint; // The endpoint is read in SocketServer::write_handshake and must be stored so that it can be read reliably in all handlers, including on_error
 
@@ -396,7 +420,7 @@ namespace SimpleWeb {
     /// The callback argument is called after the server is accepting connections,
     /// where its parameter contains the assigned port.
     void start(const std::function<void(unsigned short /*port*/)> &callback = nullptr) {
-      std::unique_lock<std::recursive_mutex> lock(start_stop_mutex);
+      std::unique_lock<std::mutex> lock(start_stop_mutex);
 
       stopping.store(false);
       handler_runner = std::shared_ptr<ScopeRunner>(new ScopeRunner());
@@ -487,7 +511,7 @@ namespace SimpleWeb {
       std::unordered_set<std::shared_ptr<Connection>> connections_to_close;
       std::shared_ptr<ScopeRunner> runner;
       {
-        std::lock_guard<std::recursive_mutex> lock(start_stop_mutex);
+        std::lock_guard<std::mutex> lock(start_stop_mutex);
 
         stopping.store(true);
         runner = handler_runner;
@@ -503,6 +527,8 @@ namespace SimpleWeb {
 
         {
           LockGuard lock(connections_mutex);
+          for(auto &connection : connections)
+            connection->cancel_publication();
           connections_to_close.swap(connections);
         }
         for(auto &connection : connections_to_close)
@@ -526,7 +552,7 @@ namespace SimpleWeb {
 
     /// Stop accepting new connections
     void stop_accept() noexcept {
-      std::lock_guard<std::recursive_mutex> lifecycle_lock(start_stop_mutex);
+      std::lock_guard<std::mutex> lifecycle_lock(start_stop_mutex);
       std::lock_guard<std::mutex> accept_lock(accept_mutex);
       accepting.store(false);
       if(acceptor) {
@@ -568,12 +594,20 @@ namespace SimpleWeb {
     void upgrade(const std::shared_ptr<Connection> &connection) {
       std::shared_ptr<ScopeRunner> runner;
       {
-        std::lock_guard<std::recursive_mutex> lock(start_stop_mutex);
+        std::lock_guard<std::mutex> lock(start_stop_mutex);
         runner = handler_runner;
         connection->handler_runner = runner;
       }
+      // Keep this generation alive across registration and synchronous
+      // handshake setup. If stop() races this operation, ScopeRunner treats it
+      // as an already-entered handler and waits for it before returning.
+      auto lock = runner ? runner->continue_lock() : nullptr;
+      if(!lock) {
+        reject_connection(connection);
+        return;
+      }
       if(!register_connection(connection)) {
-        connection->close();
+        reject_connection(connection);
         return;
       }
       connection->timeout_idle = config.timeout_idle;
@@ -584,10 +618,9 @@ namespace SimpleWeb {
     std::shared_ptr<io_context> io_service;
 
   protected:
-    // Recursive because user callbacks may call stop() on their owning server.
-    // The lock is held while publishing a connection and invoking on_open so
-    // an external stop cannot clear the registry between those operations.
-    mutable std::recursive_mutex start_stop_mutex;
+    // User callbacks run without this lifecycle lock. Their cancellation and
+    // generation checks are coordinated by ScopeRunner and Connection state.
+    mutable std::mutex start_stop_mutex;
 
     bool internal_io_service = false;
 
@@ -611,14 +644,19 @@ namespace SimpleWeb {
     virtual void accept(const std::shared_ptr<ScopeRunner> &runner) = 0;
 
     bool register_connection(const std::shared_ptr<Connection> &connection) {
-      std::lock_guard<std::recursive_mutex> lifecycle_lock(start_stop_mutex);
-      if(stopping.load() || handler_runner != connection->handler_runner)
+      std::lock_guard<std::mutex> lifecycle_lock(start_stop_mutex);
+      if(stopping.load() || handler_runner != connection->handler_runner || !connection->is_pending())
         return false;
       LockGuard lock(connections_mutex);
-      if(stopping.load() || handler_runner != connection->handler_runner)
+      if(stopping.load() || handler_runner != connection->handler_runner || !connection->is_pending())
         return false;
       connections.insert(connection);
       return true;
+    }
+
+    bool is_current_generation(const std::shared_ptr<Connection> &connection) const {
+      std::lock_guard<std::mutex> lifecycle_lock(start_stop_mutex);
+      return !stopping.load() && handler_runner == connection->handler_runner;
     }
 
     void reject_connection(const std::shared_ptr<Connection> &connection) const {
@@ -627,6 +665,7 @@ namespace SimpleWeb {
     }
 
     void unregister_connection(const std::shared_ptr<Connection> &connection) const {
+      connection->cancel_publication();
       LockGuard lock(connections_mutex);
       connections.erase(connection);
     }
@@ -943,16 +982,27 @@ namespace SimpleWeb {
     }
 
     bool connection_open(const std::shared_ptr<Connection> &connection, Endpoint &endpoint) const {
-      std::lock_guard<std::recursive_mutex> lifecycle_lock(start_stop_mutex);
-      if(stopping.load() || handler_runner != connection->handler_runner) {
-        connection->close();
-        unregister_connection(connection);
-        return false;
-      }
-
       {
+        std::lock_guard<std::mutex> lifecycle_lock(start_stop_mutex);
+        // The state transition and endpoint insertion are the publication
+        // point. stop() takes the same lifecycle lock before cancelling and
+        // clearing the registry, while user callbacks run after it is released.
+        if(stopping.load() || handler_runner != connection->handler_runner || !connection->try_publish_open()) {
+          reject_connection(connection);
+          return false;
+        }
+
         LockGuard lock(endpoint.connections_mutex);
         endpoint.connections.insert(connection);
+      }
+
+      if(!connection->is_opened() || !is_current_generation(connection)) {
+        reject_connection(connection);
+        {
+          LockGuard lock(endpoint.connections_mutex);
+          endpoint.connections.erase(connection);
+        }
+        return false;
       }
 
       if(endpoint.on_open)
@@ -961,9 +1011,8 @@ namespace SimpleWeb {
       // on_open may synchronously stop() or start() the server. In either
       // case this connection belongs to a cancelled generation and must not
       // continue into read_message().
-      if(stopping.load() || handler_runner != connection->handler_runner) {
-        connection->close();
-        unregister_connection(connection);
+      if(!connection->is_opened() || !is_current_generation(connection)) {
+        reject_connection(connection);
         {
           LockGuard lock(endpoint.connections_mutex);
           endpoint.connections.erase(connection);
