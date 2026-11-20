@@ -24,3 +24,64 @@ add_executable(swss_scope_runner_test scope_runner_test.cpp)
 target_link_libraries(swss_scope_runner_test simple-websocket-server)
 set_target_properties(swss_scope_runner_test PROPERTIES CXX_STANDARD ${CMAKE_CXX_STANDARD} CXX_STANDARD_REQUIRED ON)
 add_test(swss_scope_runner_test swss_scope_runner_test)
+
+add_executable(swss_lifecycle_test lifecycle_test.cpp)
+target_link_libraries(swss_lifecycle_test simple-websocket-server)
+set_target_properties(swss_lifecycle_test PROPERTIES CXX_STANDARD ${CMAKE_CXX_STANDARD} CXX_STANDARD_REQUIRED ON)
+add_test(swss_lifecycle_test swss_lifecycle_test)
+
+add_executable(swss_client_error_test client_error_test.cpp)
+target_link_libraries(swss_client_error_test simple-websocket-server)
+set_target_properties(swss_client_error_test PROPERTIES CXX_STANDARD ${CMAKE_CXX_STANDARD} CXX_STANDARD_REQUIRED ON)
+add_test(swss_client_error_test swss_client_error_test)
+
+add_executable(swss_destruction_test destruction_test.cpp)
+target_link_libraries(swss_destruction_test simple-websocket-server)
+set_target_properties(swss_destruction_test PROPERTIES CXX_STANDARD ${CMAKE_CXX_STANDARD} CXX_STANDARD_REQUIRED ON)
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/data/server_cert.pem ${CMAKE_CURRENT_BINARY_DIR}/server_cert.pem COPYONLY)
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/data/server_key.pem ${CMAKE_CURRENT_BINARY_DIR}/server_key.pem COPYONLY)
+add_test(swss_destruction_test swss_destruction_test)
+
+add_executable(swss_wss_destruction_test wss_destruction_test.cpp)
+target_link_libraries(swss_wss_destruction_test simple-websocket-server)
+set_target_properties(swss_wss_destruction_test PROPERTIES CXX_STANDARD ${CMAKE_CXX_STANDARD} CXX_STANDARD_REQUIRED ON)
+add_test(NAME swss_wss_destruction_test
+         COMMAND swss_wss_destruction_test
+                 ${CMAKE_CURRENT_BINARY_DIR}/server_cert.pem
+                 ${CMAKE_CURRENT_BINARY_DIR}/server_key.pem)
+
+add_executable(swss_stop_accept_test stop_accept_test.cpp)
+target_link_libraries(swss_stop_accept_test simple-websocket-server)
+set_target_properties(swss_stop_accept_test PROPERTIES CXX_STANDARD ${CMAKE_CXX_STANDARD} CXX_STANDARD_REQUIRED ON)
+add_test(swss_stop_accept_test swss_stop_accept_test)
+
+add_executable(swss_stop_generation_test stop_generation_test.cpp)
+target_link_libraries(swss_stop_generation_test simple-websocket-server)
+set_target_properties(swss_stop_generation_test PROPERTIES CXX_STANDARD ${CMAKE_CXX_STANDARD} CXX_STANDARD_REQUIRED ON)
+add_test(swss_stop_generation_test swss_stop_generation_test)
+
+# Instrument only this single-TU test, not the installed/public header. These
+# pauses make the otherwise invisible admission windows deterministic.
+configure_file(../server_ws.hpp admission_source.hpp COPYONLY)
+file(READ "${CMAKE_CURRENT_BINARY_DIR}/admission_source.hpp" admission_source)
+set(open_anchor "      if(endpoint.on_open)")
+set(upgrade_anchor "      auto lock = runner ? runner->continue_lock() : nullptr;")
+set(handshake_anchor "      connection->timeout_idle = config.timeout_idle;")
+string(FIND "${admission_source}" "${open_anchor}" open_position)
+string(FIND "${admission_source}" "${upgrade_anchor}" upgrade_position)
+string(FIND "${admission_source}" "${handshake_anchor}" handshake_position)
+if(open_position EQUAL -1 OR upgrade_position EQUAL -1 OR handshake_position EQUAL -1)
+    message(FATAL_ERROR "Callback admission test instrumentation no longer matches server_ws.hpp")
+endif()
+string(REPLACE "${open_anchor}" "      AdmissionTest::before_open();\n${open_anchor}" admission_source "${admission_source}")
+string(REPLACE "${upgrade_anchor}" "      AdmissionTest::before_upgrade();\n${upgrade_anchor}" admission_source "${admission_source}")
+string(REPLACE "${handshake_anchor}" "      AdmissionTest::before_handshake();\n${handshake_anchor}" admission_source "${admission_source}")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/admission_server_ws.hpp" "${admission_source}")
+
+add_executable(swss_callback_admission_test callback_admission_test.cpp)
+target_include_directories(swss_callback_admission_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_link_libraries(swss_callback_admission_test simple-websocket-server)
+set_target_properties(swss_callback_admission_test PROPERTIES CXX_STANDARD ${CMAKE_CXX_STANDARD} CXX_STANDARD_REQUIRED ON)
+add_test(NAME swss_callback_admission_test COMMAND swss_callback_admission_test
+         ${CMAKE_CURRENT_BINARY_DIR}/server_cert.pem ${CMAKE_CURRENT_BINARY_DIR}/server_key.pem)
+set_tests_properties(swss_callback_admission_test swss_stop_generation_test PROPERTIES TIMEOUT 30)

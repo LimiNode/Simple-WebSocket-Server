@@ -66,18 +66,28 @@ namespace SimpleWeb {
       }
     }
 
-    void accept() override {
-      std::shared_ptr<Connection> connection(new Connection(handler_runner, config.timeout_idle, config.max_handshake_size, *io_service, context));
+    void accept(const std::shared_ptr<ScopeRunner> &runner) override {
+      std::unique_lock<std::mutex> accept_lock(accept_mutex);
+      if(stopping.load() || !accepting.load())
+        return;
+      std::shared_ptr<Connection> connection(new Connection(runner, config.timeout_idle, config.max_handshake_size, *io_service, context));
 
       acceptor->async_accept(connection->socket->lowest_layer(), [this, connection](const error_code &ec) {
         auto lock = connection->handler_runner->continue_lock();
-        if(!lock)
+        if(!lock) {
+          connection->close();
           return;
+        }
         // Immediately start accepting a new connection (if io_service hasn't been stopped)
-        if(ec != error::operation_aborted)
-          accept();
+        if(ec != error::operation_aborted && !stopping.load() && accepting.load())
+          accept(connection->handler_runner);
 
         if(!ec) {
+          if(!register_connection(connection)) {
+            connection->close();
+            return;
+          }
+
           asio::ip::tcp::no_delay option(true);
           connection->socket->lowest_layer().set_option(option);
 
@@ -85,10 +95,15 @@ namespace SimpleWeb {
           connection->socket->async_handshake(asio::ssl::stream_base::server, [this, connection](const error_code &ec) {
             connection->cancel_timeout();
             auto lock = connection->handler_runner->continue_lock();
-            if(!lock)
+            if(!lock) {
+              connection->close();
               return;
+            }
             if(!ec)
               read_handshake(connection);
+            else {
+              reject_connection(connection);
+            }
           });
         }
       });
