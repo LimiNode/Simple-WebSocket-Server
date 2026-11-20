@@ -1012,9 +1012,8 @@ namespace SimpleWeb {
       if(endpoint.on_open)
         endpoint.on_open(connection);
 
-      // on_open may synchronously stop() or start() the server. In either
-      // case this connection belongs to a cancelled generation and must not
-      // continue into read_message().
+      // on_open may synchronously stop() the server. A cancelled connection
+      // must not continue into read_message().
       if(!connection->is_opened() || !is_current_generation(connection)) {
         reject_connection(connection);
         {
