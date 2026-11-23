@@ -498,8 +498,7 @@ namespace SimpleWeb {
         if(config.thread_pool_size > 0)
           io_service->run();
 
-        lock.lock();
-
+        // Handlers may need the lifecycle mutex before their worker can exit.
         // Wait for the rest of the threads, if any, to finish as well
         for(auto &t : threads)
           t.join();

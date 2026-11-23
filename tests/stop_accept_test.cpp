@@ -66,6 +66,6 @@ int main() {
   ASSERT(server.pending_connection_count() == 1);
 
   server.stop();
-  context->restart();
+  SimpleWeb::restart(*context);
   context->run();
 }

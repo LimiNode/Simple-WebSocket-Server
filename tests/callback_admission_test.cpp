@@ -8,12 +8,16 @@
 
 namespace AdmissionTest {
   std::function<void()> open_pause, upgrade_pause, handshake_pause;
+  std::function<void()> run_pause, join_pause, registration_pause;
   void before_open() { if(open_pause) open_pause(); }
   void before_upgrade() { if(upgrade_pause) upgrade_pause(); }
   void before_handshake() { if(handshake_pause) handshake_pause(); }
+  void before_run() { if(run_pause) run_pause(); }
+  void before_join() { if(join_pause) join_pause(); }
+  void before_registration() { if(registration_pause) registration_pause(); }
 }
 
-// This header differs from server_ws.hpp only by the three pauses above.
+// This header differs from server_ws.hpp only by the test pauses above.
 #include "admission_server_ws.hpp"
 #include "server_wss.hpp"
 
@@ -166,6 +170,43 @@ void test_upgrade_admission(bool admitted) {
   AdmissionTest::handshake_pause = nullptr;
 }
 
+template<class Server>
+void test_thread_pool_stop(Server &server) {
+  server.config.address = "127.0.0.1";
+  server.config.port = 0;
+  server.config.thread_pool_size = 2;
+  Event main_ready, resume_main, registration_entered, resume_registration, join_entered;
+  AdmissionTest::run_pause = [&] { main_ready.set(); resume_main.wait(); };
+  AdmissionTest::join_pause = [&] { join_entered.set(); };
+  AdmissionTest::registration_pause = [&] { registration_entered.set(); resume_registration.wait(); };
+  int opens = 0;
+  server.endpoint["^/$"].on_open = [&](std::shared_ptr<typename Server::Connection>) { ++opens; };
+
+  auto started = std::async(std::launch::async, [&] { server.start(); });
+  main_ready.wait(); // the main run thread is held; only the worker can accept
+  SimpleWeb::io_context peer_context;
+  Tcp::socket peer(peer_context);
+  peer.connect(Tcp::endpoint(SimpleWeb::make_address("127.0.0.1"), server.port()));
+  registration_entered.wait(); // worker holds ScopeRunner, before lifecycle lock
+  auto stopped = std::async(std::launch::async, [&] { server.stop(); });
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while(!server.cancellation_finished() && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::yield();
+  ASSERT(server.cancellation_finished());
+  resume_main.set(); // stopped io_context returns; start() begins joining worker
+  join_entered.wait();
+  resume_registration.set(); // worker must acquire lifecycle lock to reject socket
+  ASSERT(stopped.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+  ASSERT(started.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+  stopped.get();
+  started.get();
+  ASSERT(opens == 0);
+  ASSERT(server.tracked() == 0 && server.get_connections().empty());
+  AdmissionTest::run_pause = nullptr;
+  AdmissionTest::join_pause = nullptr;
+  AdmissionTest::registration_pause = nullptr;
+}
+
 int main(int argc, char **argv) {
   ASSERT(argc == 3);
   {
@@ -176,21 +217,33 @@ int main(int argc, char **argv) {
       TestServer<SimpleWeb::WS> server;
       test_open_admission(server, peer, server_context);
     }
-    server_context->restart();
+    SimpleWeb::restart(*server_context);
     server_context->run(); // drain after destruction under ASan
   }
   {
     SimpleWeb::io_context context;
+#if (defined(ASIO_STANDALONE) && ASIO_VERSION >= 101300) || BOOST_ASIO_VERSION >= 101300
     test_asio::ssl::context tls(test_asio::ssl::context::tls_client);
+#else
+    test_asio::ssl::context tls(test_asio::ssl::context::tlsv12_client);
+#endif
     SimpleWeb::WSS peer(context, tls);
     auto server_context = std::make_shared<SimpleWeb::io_context>();
     {
       TestServer<SimpleWeb::WSS> server(argv[1], argv[2]);
       test_open_admission(server, peer, server_context);
     }
-    server_context->restart();
+    SimpleWeb::restart(*server_context);
     server_context->run();
   }
   test_upgrade_admission(false);
   test_upgrade_admission(true);
+  {
+    TestServer<SimpleWeb::WS> server;
+    test_thread_pool_stop(server);
+  }
+  {
+    TestServer<SimpleWeb::WSS> server(argv[1], argv[2]);
+    test_thread_pool_stop(server);
+  }
 }

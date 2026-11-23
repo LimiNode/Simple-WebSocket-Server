@@ -195,7 +195,7 @@ int main() {
   ASSERT(server.get_connections().empty());
   ASSERT(server.open_callbacks.load() == 0);
 
-  context->restart();
+  SimpleWeb::restart(*context);
   context->poll();
   ASSERT(server.get_connections().empty());
   ASSERT(server.open_callbacks.load() == 0);
@@ -208,7 +208,7 @@ int main() {
 
   // stop() from the owning on_open callback must remain non-blocking.
   context->poll();
-  context->restart();
+  SimpleWeb::restart(*context);
   server.stop_from_on_open = true;
   server.start();
   server.captured_connection.reset();

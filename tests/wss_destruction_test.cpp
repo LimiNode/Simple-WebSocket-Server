@@ -42,7 +42,7 @@ int main(int argc, char **argv) {
 
   // The server and its TLS context are gone. The queued handshake completion
   // must only close the connection and must not dereference the old server.
-  context->restart();
+  SimpleWeb::restart(*context);
   context->run();
   peer.close(ec);
 }
