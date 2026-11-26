@@ -10,6 +10,7 @@ This repository is a maintained downstream continuation of eidheim/Simple-WebSoc
 Tags with the `-ln.N` suffix are LimiNode-maintained downstream releases.
 They are not releases published by the original upstream project.
 The `v2.0.3-ln.1` release is represented as CMake package version `2.0.3.1`.
+The `v2.0.3-ln.2` corrective release is represented as CMake package version `2.0.3.2`.
 
 ### Downstream compatibility notes
 

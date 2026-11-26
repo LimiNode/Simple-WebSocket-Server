@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.8)
 
-# CMake uses a numeric fourth component for the downstream -ln.1 release.
-project(Simple-WebSocket-Server VERSION 2.0.3.1 LANGUAGES CXX)
+# CMake represents downstream -ln.N releases with a numeric fourth component.
+project(Simple-WebSocket-Server VERSION 2.0.3.2 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 
