@@ -26,6 +26,22 @@ Before destroying the owner, an external caller must complete the normal
 `stop()`/destructor barrier. Destroying the owner synchronously from inside
 its own callback is not a supported ownership pattern in C++.
 
+For server handshakes, the final successful generation check after pending-to-open
+publication is the admission point for `on_open`. Cancellation that wins
+before that point closes the connection and suppresses `on_open` and subsequent
+message handling. Once the handler has passed admission, another thread may
+begin `stop()` before the user callback is invoked; that callback is already
+admitted, and an external `stop()` waits for it to finish before returning.
+`stop()` called by the callback itself remains a cancellation request and does
+not wait for the callback that is currently executing.
+
+A callback must not wait for an external `stop()` on the same owner to return:
+that call is waiting for the callback itself. Restart only after the previous
+generation has drained through an external `stop()` and its `start()` call has
+returned; restarting synchronously from a callback or concurrently with `stop()`
+is not supported. Keep the owner alive until concurrent public member calls,
+including `upgrade()`, have returned as well.
+
 See https://gitlab.com/eidheim/Simple-Web-Server for an easy way to make REST resources available from C++ applications. Also, feel free to check out the new C++ IDE supporting C++11/14/17: https://gitlab.com/cppit/jucipp. 
 
 ### Features
